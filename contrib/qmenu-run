@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+#
+# Example launcher for qmenu in drun mode, with toggle behaviour: bind this to a
+# key (e.g. Super+Space). Pressing the key opens qmenu; pressing it again while
+# qmenu is open closes it instead of opening a second instance.
+#
+# Terminal=true desktop entries are wrapped using $TERMINAL (default: xterm);
+# qmenu reads QMENU_TERMINAL first, then TERMINAL.
+set -u
+
+pidfile="${XDG_RUNTIME_DIR:-/tmp}/qmenu.pid"
+
+# Already open? Close it and stop.
+if [ -f "$pidfile" ]; then
+  oldpid="$(cat "$pidfile" 2>/dev/null || true)"
+  if [ -n "${oldpid:-}" ] && kill -0 "$oldpid" 2>/dev/null; then
+    kill "$oldpid" 2>/dev/null
+    rm -f "$pidfile"
+    exit 0
+  fi
+  rm -f "$pidfile" # stale pidfile from a crashed instance
+fi
+
+out="$(mktemp)"
+qmenu --drun >"$out" &
+qpid=$!
+echo "$qpid" >"$pidfile"
+wait "$qpid"
+rm -f "$pidfile"
+
+choice="$(cat "$out")"
+rm -f "$out"
+[ -n "$choice" ] && exec setsid -f sh -c "$choice"

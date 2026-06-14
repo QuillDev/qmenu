@@ -1,0 +1,6 @@
+# Rust build artifacts
+/target
+
+# Nix build results
+/result
+/result-*
