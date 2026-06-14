@@ -18,7 +18,7 @@ use cosmic_text::{
     SwashCache, Wrap,
 };
 use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState},
+    compositor::{CompositorHandler, CompositorState, Region},
     delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_registry,
     delegate_seat, delegate_shm,
     output::{OutputHandler, OutputState},
@@ -120,6 +120,14 @@ fn main() {
     layer.set_anchor(Anchor::TOP);
     layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
 
+    // Keyboard-only launcher: an empty input region makes the surface
+    // click-through, so the fixed-size (and partly transparent) overlay never
+    // swallows pointer events meant for windows beneath it.
+    let input_region = Region::new(&compositor).expect("failed to create an input region");
+    layer
+        .wl_surface()
+        .set_input_region(Some(input_region.wl_region()));
+
     let icon_loader = IconLoader::new(config.icon_size, config.icon_theme.clone());
 
     // Pool sized for the largest buffer we might draw (full width × max height:
@@ -141,6 +149,7 @@ fn main() {
         shm,
         pool,
         layer,
+        _input_region: input_region,
         keyboard: None,
         modifiers: Modifiers::default(),
 
@@ -198,7 +207,10 @@ fn main() {
     };
     state.layer.set_margin(margin_top, 0, 0, 0);
     state.width = bar_width;
-    state.height = state.content_height();
+    // Fixed surface height (the fully-expanded size). The surface never resizes,
+    // so the compositor never plays a stretch animation that would make the
+    // prompt jump; results simply draw into the reserved transparent area below.
+    state.height = max_height;
     state.layer.set_size(state.width, state.height);
     state.layer.commit();
 
@@ -238,6 +250,8 @@ struct Qmenu {
     shm: Shm,
     pool: SlotPool,
     layer: LayerSurface,
+    /// Kept alive so the surface's (empty) input region stays valid.
+    _input_region: Region,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     modifiers: Modifiers,
 
@@ -264,27 +278,6 @@ struct Qmenu {
 }
 
 impl Qmenu {
-    /// Number of result rows shown in the results panel right now.
-    fn visible_count(&self) -> usize {
-        let end = (self.scroll + self.config.max_visible_items).min(self.filtered.len());
-        end - self.scroll
-    }
-
-    /// Total surface height: the constant prompt panel, plus (when there are
-    /// matches) a gap and a separate results panel below it.
-    fn content_height(&self) -> u32 {
-        let cfg = &self.config;
-        let panel_pad = 2.0 * (cfg.pad_y + cfg.border_width);
-        let prompt_h = cfg.line_height + panel_pad;
-        let nvis = self.visible_count();
-        let total = if nvis == 0 {
-            prompt_h
-        } else {
-            prompt_h + cfg.result_gap + (nvis as f32 * cfg.line_height + panel_pad)
-        };
-        total.ceil() as u32
-    }
-
     fn recompute_filter(&mut self) {
         let q = self.query.to_lowercase();
         self.filtered = if q.is_empty() && !self.config.show_all_when_empty {
@@ -382,13 +375,8 @@ impl Qmenu {
         self.query.truncate(self.cursor);
     }
 
-    /// Resize the surface to fit the current results, then redraw.
+    /// Redraw. The surface is a fixed size, so this never resizes it.
     fn relayout_and_draw(&mut self, qh: &QueueHandle<Self>) {
-        let h = self.content_height();
-        if h != self.height {
-            self.height = h;
-            self.layer.set_size(self.width, self.height);
-        }
         self.draw(qh);
     }
 
