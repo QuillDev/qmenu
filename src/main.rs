@@ -113,8 +113,14 @@ fn main() {
     // centre us horizontally; the concrete width comes from the output below.
     let surface = compositor.create_surface(&qh);
     let layer = layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("qmenu"), None);
-    layer.set_anchor(Anchor::TOP);
-    layer.set_margin(config.margin_top, 0, 0, 0);
+    // "top": anchored near the top with margin_top. "center" (default): no
+    // vertical anchor, so the compositor centres the bar in the screen.
+    if config.anchor == "top" {
+        layer.set_anchor(Anchor::TOP);
+        layer.set_margin(config.margin_top, 0, 0, 0);
+    } else {
+        layer.set_anchor(Anchor::empty());
+    }
     layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
 
     let icon_loader = IconLoader::new(config.icon_size, config.icon_theme.clone());
@@ -717,8 +723,9 @@ fn apply_frame(canvas: &mut [u8], cw: u32, ch: u32, radius: f32, border_w: f32, 
 
             // Fold the pixel's own (possibly translucent) alpha with the corner
             // coverage, then premultiply — wl_shm Argb8888 is premultiplied, and
-            // this is what fades the corners to transparent.
-            let final_a = canvas[off + 3] as f32 * outer / 255.0;
+            // this is what fades the corners to transparent. `outer` is 0..1 and
+            // the stored alpha is 0..255, so final_a is already 0..255.
+            let final_a = canvas[off + 3] as f32 * outer;
             let factor = final_a / 255.0;
             canvas[off] = (canvas[off] as f32 * factor) as u8;
             canvas[off + 1] = (canvas[off + 1] as f32 * factor) as u8;

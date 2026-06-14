@@ -44,6 +44,8 @@ pub struct Config {
     pub border_width: f32,
     pub row_radius: f32,
     pub font_family: Option<String>,
+    /// Vertical placement: "center" (default) or "top" (uses `margin_top`).
+    pub anchor: String,
 
     // Icons.
     pub icons_enabled: bool,
@@ -82,6 +84,7 @@ impl Default for Config {
             border_width: 2.0,
             row_radius: 8.0,
             font_family: None,
+            anchor: "center".to_string(),
 
             icons_enabled: true,
             icon_size: 20,
@@ -171,6 +174,7 @@ struct RawLayout {
     border_width: Option<f32>,
     row_radius: Option<f32>,
     font_family: Option<String>,
+    anchor: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -215,6 +219,7 @@ impl RawConfig {
         if let Some(v) = l.border_width { c.border_width = v; }
         if let Some(v) = l.row_radius { c.row_radius = v; }
         if l.font_family.is_some() { c.font_family = l.font_family; }
+        if let Some(v) = l.anchor { c.anchor = v; }
 
         let i = self.icons;
         if let Some(v) = i.enabled { c.icons_enabled = v; }

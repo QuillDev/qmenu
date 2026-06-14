@@ -13,9 +13,10 @@ muted                = "#9399b2"    # placeholder text
 border               = "#89b4fa"    # outline
 
 [layout]
+anchor            = "center" # "center" (middle of screen) or "top"
 width_fraction    = 0.45    # bar width as a fraction of the output width
 min_width         = 480     # ...but never narrower than this (px)
-margin_top        = 8       # gap below the top screen edge (px)
+margin_top        = 8       # gap below the top edge (px); only used when anchor="top"
 max_visible_items = 12      # rows shown before scrolling
 font_size         = 15.0
 line_height       = 30.0    # row height (px)
