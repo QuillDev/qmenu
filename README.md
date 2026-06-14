@@ -1,10 +1,11 @@
 # qmenu
 
-A minimal dmenu/rofi-style launcher for Wayland compositors that support
-[`wlr-layer-shell`](https://wayland.app/protocols/wlr-layer-shell-unstable-v1)
-(Hyprland, Sway, river, …). It renders a centred bar near the top of the screen,
-lets you type to filter, and either prints your choice (dmenu mode) or launches
-an application (drun mode).
+A minimal, themeable dmenu/rofi-style launcher for Wayland compositors that
+support [`wlr-layer-shell`](https://wayland.app/protocols/wlr-layer-shell-unstable-v1)
+(Hyprland, Sway, river, …). It renders a centred, rounded floating bar near the
+top of the screen, lets you type to filter, and either prints your choice (dmenu
+mode) or launches an application — with icons — (drun mode). Colours, fonts,
+sizes, icons and behaviour are all driven by a [TOML config file](#configuration).
 
 It is a small, dependency-light Rust program built on
 [`smithay-client-toolkit`](https://crates.io/crates/smithay-client-toolkit) for
@@ -23,11 +24,13 @@ memory buffer — no GPU/EGL required.
   ```
 
 - **drun mode (`--drun`).** Ignores stdin and instead discovers XDG `.desktop`
-  application entries, shows their friendly `Name`, and prints the selected
-  app's cleaned `Exec` line to stdout. Entries marked `NoDisplay`/`Hidden` and
-  non-`Application` types are skipped, and desktop-file IDs are de-duplicated
-  following the freedesktop precedence rules (`$XDG_DATA_HOME` shadows the system
-  directories). This is the equivalent of `rofi -show drun`.
+  application entries, shows their friendly `Name` (with the app icon), and
+  prints the selected app's cleaned `Exec` line to stdout. Entries marked
+  `NoDisplay`/`Hidden` and non-`Application` types are skipped, and desktop-file
+  IDs are de-duplicated following the freedesktop precedence rules
+  (`$XDG_DATA_HOME` shadows the system directories). Icons are resolved against
+  the freedesktop icon theme dirs and rasterised from PNG or SVG. This is the
+  equivalent of `rofi -show drun`.
 
   ```sh
   qmenu --drun
@@ -97,16 +100,45 @@ Example Sway bind:
 bindsym $mod+space exec qmenu-run
 ```
 
-## Appearance
+## Configuration
 
-Layout and colours are compile-time constants at the top of `src/main.rs`
-(`FONT_SIZE`, `LINE_HEIGHT`, the `BG`/`FG`/`SEL_BG`/`PROMPT_FG` palette, and
-`WIDTH_FRACTION`/`MIN_WIDTH`/`MARGIN_TOP` for the centred bar). Tweak and rebuild.
+qmenu reads a TOML config file; every key is optional and falls back to a
+built-in default. The lookup order (first that exists wins) is:
+
+1. `--config <path>`
+2. `$QMENU_CONFIG`
+3. `$XDG_CONFIG_HOME/qmenu/config.toml` (i.e. `~/.config/qmenu/config.toml`)
+4. `$QMENU_DEFAULT_CONFIG` — a packaged fallback (see [Nix](#nix) below)
+
+Copy [`config.example.toml`](config.example.toml) to
+`~/.config/qmenu/config.toml` and edit. It documents the full schema: the colour
+palette, geometry (`width_fraction`, `corner_radius`, `border_width`, paddings,
+`font_size`, `font_family`, …), `[icons]` (toggle/size/theme), and `[behavior]`
+(`show_all_when_empty`, `placeholder`, `terminal`). Colours accept `#rgb`,
+`#rrggbb`, or `#aarrggbb`.
+
+By default nothing is shown until you start typing; set
+`behavior.show_all_when_empty = true` for the classic always-listed behaviour.
+
+### Theming via the flake
+
+The Nix package takes an optional `settings` attrset (the config schema as Nix),
+serialised to TOML and baked in as `QMENU_DEFAULT_CONFIG` — a shipped default
+theme that a user's own `~/.config/qmenu/config.toml` still overrides:
+
+```nix
+inputs.qmenu.packages.${system}.default.override {
+  settings = {
+    colors.background = "#0b0b10";
+    colors.border = "#ff4fa3";
+    layout.font_family = "Inter";
+  };
+};
+```
 
 ## Limitations
 
 - Substring filtering only (no fuzzy ranking).
-- No icons.
 - No HiDPI / fractional-scale handling (text uses logical pixels).
 
 ## License

@@ -1,14 +1,21 @@
-//! qmenu — a minimal dmenu/rofi-style launcher for wlr-layer-shell compositors.
+//! qmenu — a minimal, themeable dmenu/rofi-style launcher for wlr-layer-shell
+//! compositors.
 //!
-//! Reads newline-separated items on stdin, shows a full-width bar at the top of
-//! the screen, lets you type to filter, and prints the chosen line to stdout.
+//! It renders a centred, rounded floating bar near the top of the screen, lets
+//! you type to filter, and either prints your choice (dmenu mode) or launches an
+//! application with icons (drun mode). Appearance and behaviour are driven by a
+//! TOML config file — see `src/config.rs`.
+
+mod config;
+mod icons;
 
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use cosmic_text::{
-    Attrs, Buffer as TextBuffer, Color as TextColor, FontSystem, Metrics, Shaping, SwashCache, Wrap,
+    Attrs, Buffer as TextBuffer, Color as TextColor, Family, FontSystem, Metrics, Shaping,
+    SwashCache, Wrap,
 };
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -36,89 +43,86 @@ use wayland_client::{
     Connection, QueueHandle,
 };
 
-// ---- Appearance ---------------------------------------------------------------
+use config::Config;
+use icons::IconLoader;
 
-const FONT_SIZE: f32 = 16.0;
-const LINE_HEIGHT: f32 = 24.0;
-const PAD_X: f32 = 12.0;
-const PAD_Y: f32 = 6.0;
-const MAX_VISIBLE_ITEMS: usize = 14;
-
-// Centred floating bar: fraction of the output width, with a floor and a small
-// gap below the top edge.
-const WIDTH_FRACTION: f32 = 0.45;
-const MIN_WIDTH: u32 = 480;
 const FALLBACK_SCREEN_WIDTH: u32 = 1920;
-const MARGIN_TOP: i32 = 8;
 
-// 0xAARRGGBB
-const BG: u32 = 0xff1e1e2e;
-const FG: u32 = 0xffcdd6f4;
-const SEL_BG: u32 = 0xff45475a;
-const PROMPT_FG: u32 = 0xff89b4fa;
-
-fn argb_to_text_color(c: u32) -> TextColor {
-    let a = ((c >> 24) & 0xff) as u8;
-    let r = ((c >> 16) & 0xff) as u8;
-    let g = ((c >> 8) & 0xff) as u8;
-    let b = (c & 0xff) as u8;
-    TextColor::rgba(r, g, b, a)
+/// A selectable row: a visible `name`, the `action` emitted on stdout when
+/// chosen, and an optional icon name (drun mode).
+struct Entry {
+    name: String,
+    action: String,
+    icon: Option<String>,
 }
 
 fn main() {
-    // 1. Build the candidate list. Two modes:
-    //   --drun : parse XDG .desktop entries (rofi drun-style app launcher); the
-    //            visible label is the app Name, the action is its cleaned Exec.
-    //   default: read newline-separated items from stdin (dmenu-style); each line
-    //            is both the label and the action.
-    let drun = std::env::args().skip(1).any(|a| a == "--drun");
+    let mut drun = false;
+    let mut config_path: Option<PathBuf> = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--drun" => drun = true,
+            "--config" => config_path = args.next().map(PathBuf::from),
+            "-h" | "--help" => {
+                print_help();
+                return;
+            }
+            s if s.starts_with("--config=") => {
+                config_path = Some(PathBuf::from(&s["--config=".len()..]));
+            }
+            _ => {}
+        }
+    }
 
-    let (items, actions, allow_custom): (Vec<String>, Vec<String>, bool) = if drun {
-        let entries = load_desktop_entries();
-        let items = entries.iter().map(|(n, _)| n.clone()).collect();
-        let actions = entries.into_iter().map(|(_, e)| e).collect();
-        // Apps-only: don't run an arbitrary typed command when nothing matches.
-        (items, actions, false)
+    let config = Config::load(config_path);
+
+    // Build the candidate list. drun → XDG .desktop apps (with icons); default →
+    // newline-separated stdin (dmenu-style, no icons, raw query allowed).
+    let (entries, allow_custom): (Vec<Entry>, bool) = if drun {
+        (load_desktop_entries(&config.terminal), false)
     } else {
         let mut input = String::new();
         std::io::stdin()
             .read_to_string(&mut input)
             .expect("failed to read stdin");
-        let items: Vec<String> = input
+        let entries = input
             .lines()
-            .map(|l| l.to_string())
             .filter(|l| !l.is_empty())
+            .map(|l| Entry {
+                name: l.to_string(),
+                action: l.to_string(),
+                icon: None,
+            })
             .collect();
-        let actions = items.clone();
-        (items, actions, true)
+        (entries, true)
     };
 
-    // 2. Connect to the Wayland compositor.
+    // Connect to Wayland.
     let conn = Connection::connect_to_env().expect("could not connect to a Wayland compositor");
     let (globals, mut event_queue) =
         registry_queue_init(&conn).expect("failed to initialize the Wayland registry");
     let qh = event_queue.handle();
 
-    let compositor =
-        CompositorState::bind(&globals, &qh).expect("wl_compositor is not available");
-    let layer_shell =
-        LayerShell::bind(&globals, &qh).expect("wlr-layer-shell is not available on this compositor");
+    let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor is not available");
+    let layer_shell = LayerShell::bind(&globals, &qh)
+        .expect("wlr-layer-shell is not available on this compositor");
     let shm = Shm::bind(&globals, &qh).expect("wl_shm is not available");
 
-    // 3. Create a layer surface: a centred bar anchored to the top. Anchoring to
-    // TOP only (not LEFT/RIGHT) lets the compositor centre us horizontally; the
-    // concrete width is computed from the output below.
+    // Centred bar anchored to the top: anchoring TOP only lets the compositor
+    // centre us horizontally; the concrete width comes from the output below.
     let surface = compositor.create_surface(&qh);
-    let layer =
-        layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("qmenu"), None);
+    let layer = layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("qmenu"), None);
     layer.set_anchor(Anchor::TOP);
-    layer.set_margin(MARGIN_TOP, 0, 0, 0);
+    layer.set_margin(config.margin_top, 0, 0, 0);
     layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
 
-    let visible_rows = 1 + items.len().min(MAX_VISIBLE_ITEMS);
-    let height = (visible_rows as f32 * LINE_HEIGHT + 2.0 * PAD_Y).ceil() as u32;
+    let icon_loader = IconLoader::new(config.icon_size, config.icon_theme.clone());
 
-    let pool = SlotPool::new(256 * 256 * 4, &shm).expect("failed to create a buffer pool");
+    // Pool sized for the largest buffer we might draw (full width × max height).
+    let max_height = row_top(&config, config.max_visible_items + 1) as u32 + config.pad_y as u32;
+    let pool_cap = (2200 * max_height.max(1) * 4) as usize;
+    let pool = SlotPool::new(pool_cap.max(256 * 256 * 4), &shm).expect("failed to create a buffer pool");
 
     let mut state = Qmenu {
         registry_state: RegistryState::new(&globals),
@@ -132,13 +136,14 @@ fn main() {
 
         font_system: FontSystem::new(),
         swash_cache: SwashCache::new(),
+        icon_loader,
+        config,
 
         width: 0,
-        height,
+        height: 0,
         configured: false,
 
-        items,
-        actions,
+        entries,
         allow_custom,
         query: String::new(),
         filtered: Vec::new(),
@@ -166,9 +171,12 @@ fn main() {
         .map(|(w, _)| w as u32)
         .max()
         .unwrap_or(FALLBACK_SCREEN_WIDTH);
-    let bar_width = ((screen_width as f32 * WIDTH_FRACTION) as u32).max(MIN_WIDTH);
+    let bar_width = ((screen_width as f32 * state.config.width_fraction) as u32)
+        .max(state.config.min_width)
+        .min(2200);
     state.width = bar_width;
-    state.layer.set_size(bar_width, height);
+    state.height = state.content_height();
+    state.layer.set_size(state.width, state.height);
     state.layer.commit();
 
     loop {
@@ -181,12 +189,23 @@ fn main() {
     }
 
     if let Some(choice) = state.result {
-        let mut out = std::io::stdout();
-        let _ = writeln!(out, "{}", choice);
+        let _ = writeln!(std::io::stdout(), "{}", choice);
     } else {
-        // Nothing chosen (Escape): exit non-zero like dmenu.
         std::process::exit(1);
     }
+}
+
+fn print_help() {
+    println!(
+        "qmenu — minimal themeable launcher for wlr-layer-shell\n\n\
+         USAGE:\n    qmenu [--drun] [--config <path>]\n\n\
+         MODES:\n    (default)   read newline items from stdin, print the choice (dmenu)\n    \
+         --drun      list XDG .desktop apps with icons, print the chosen Exec\n\n\
+         OPTIONS:\n    --config <path>   use this config file instead of the default\n    \
+         -h, --help        show this help\n\n\
+         CONFIG:\n    ~/.config/qmenu/config.toml (or $QMENU_CONFIG). Every colour, size,\n    \
+         font and behaviour toggle lives there; see config.example.toml."
+    );
 }
 
 struct Qmenu {
@@ -201,16 +220,14 @@ struct Qmenu {
 
     font_system: FontSystem,
     swash_cache: SwashCache,
+    icon_loader: IconLoader,
+    config: Config,
 
     width: u32,
     height: u32,
     configured: bool,
 
-    items: Vec<String>,
-    /// Parallel to `items`: what to emit on stdout when an item is chosen.
-    actions: Vec<String>,
-    /// Whether Enter on a no-match query echoes the raw query (dmenu) or does
-    /// nothing (drun apps-only).
+    entries: Vec<Entry>,
     allow_custom: bool,
     query: String,
     filtered: Vec<usize>,
@@ -221,18 +238,49 @@ struct Qmenu {
     result: Option<String>,
 }
 
+/// Y of the top of row `n` (row 0 is the prompt) given config paddings.
+fn row_top(cfg: &Config, n: usize) -> f32 {
+    cfg.pad_y + cfg.border_width + n as f32 * cfg.line_height
+}
+
 impl Qmenu {
+    /// Number of result rows currently visible (0 when the query is empty and
+    /// `show_all_when_empty` is off).
+    fn visible_rows(&self) -> usize {
+        self.filtered.len().min(self.config.max_visible_items)
+    }
+
+    /// Height needed for the prompt row plus the visible results.
+    fn content_height(&self) -> u32 {
+        let rows = 1 + self.visible_rows();
+        (rows as f32 * self.config.line_height + 2.0 * (self.config.pad_y + self.config.border_width))
+            .ceil() as u32
+    }
+
     fn recompute_filter(&mut self) {
         let q = self.query.to_lowercase();
-        self.filtered = self
-            .items
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| q.is_empty() || item.to_lowercase().contains(&q))
-            .map(|(i, _)| i)
-            .collect();
+        self.filtered = if q.is_empty() && !self.config.show_all_when_empty {
+            Vec::new()
+        } else {
+            self.entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| q.is_empty() || e.name.to_lowercase().contains(&q))
+                .map(|(i, _)| i)
+                .collect()
+        };
         self.selected = 0;
         self.scroll = 0;
+    }
+
+    /// Resize the surface to fit the current results, then redraw.
+    fn relayout_and_draw(&mut self, qh: &QueueHandle<Self>) {
+        let h = self.content_height();
+        if h != self.height {
+            self.height = h;
+            self.layer.set_size(self.width, self.height);
+        }
+        self.draw(qh);
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -240,28 +288,21 @@ impl Qmenu {
             return;
         }
         let len = self.filtered.len() as isize;
-        let mut sel = self.selected as isize + delta;
-        if sel < 0 {
-            sel = 0;
-        }
-        if sel >= len {
-            sel = len - 1;
-        }
+        let sel = (self.selected as isize + delta).clamp(0, len - 1);
         self.selected = sel as usize;
 
-        // Keep the selection within the visible window.
+        let max_vis = self.config.max_visible_items;
         if self.selected < self.scroll {
             self.scroll = self.selected;
-        } else if self.selected >= self.scroll + MAX_VISIBLE_ITEMS {
-            self.scroll = self.selected + 1 - MAX_VISIBLE_ITEMS;
+        } else if self.selected >= self.scroll + max_vis {
+            self.scroll = self.selected + 1 - max_vis;
         }
     }
 
     fn confirm(&mut self) {
         if let Some(&idx) = self.filtered.get(self.selected) {
-            self.result = Some(self.actions[idx].clone());
+            self.result = Some(self.entries[idx].action.clone());
         } else if self.allow_custom && !self.query.is_empty() {
-            // No match: echo the raw query (dmenu's behaviour).
             self.result = Some(self.query.clone());
         }
         self.exit = true;
@@ -275,99 +316,147 @@ impl Qmenu {
         let height = self.height;
         let stride = width as i32 * 4;
 
-        let (buffer, canvas) = self
-            .pool
-            .create_buffer(
-                width as i32,
-                height as i32,
-                stride,
-                wl_shm::Format::Argb8888,
-            )
+        // Disjoint borrows so the helpers can take canvas + font/icon state.
+        let Qmenu {
+            pool,
+            layer,
+            font_system,
+            swash_cache,
+            icon_loader,
+            config,
+            entries,
+            filtered,
+            query,
+            selected,
+            scroll,
+            ..
+        } = self;
+        let cfg = &*config;
+
+        let (buffer, canvas) = pool
+            .create_buffer(width as i32, height as i32, stride, wl_shm::Format::Argb8888)
             .expect("failed to create a drawing buffer");
 
-        // Background fill.
-        paint_solid(canvas, BG);
+        paint_solid(canvas, cfg.bg);
 
-        // Highlight bar behind the selected row.
-        if !self.filtered.is_empty() {
-            let row = (self.selected - self.scroll) + 1; // +1: row 0 is the prompt.
-            let y0 = PAD_Y + row as f32 * LINE_HEIGHT;
-            fill_rect(canvas, width, height, 0.0, y0, width as f32, LINE_HEIGHT, SEL_BG);
+        let icon_col = if cfg.icons_enabled {
+            cfg.icon_size as f32 + cfg.icon_gap
+        } else {
+            0.0
+        };
+        let text_x = cfg.pad_x + cfg.border_width + icon_col;
+
+        // Selection highlight (rounded), behind the selected result row.
+        if !filtered.is_empty() {
+            let row = (*selected - *scroll) + 1; // +1: row 0 is the prompt.
+            let y0 = row_top(cfg, row);
+            let inset = cfg.border_width + 6.0;
+            fill_round_rect(
+                canvas,
+                width,
+                height,
+                inset,
+                y0 + 1.0,
+                width as f32 - 2.0 * inset,
+                cfg.line_height - 2.0,
+                cfg.row_radius,
+                cfg.sel_bg,
+            );
         }
 
-        // Build the text block: prompt line + the visible slice of matches.
-        let end = (self.scroll + MAX_VISIBLE_ITEMS).min(self.filtered.len());
-        let mut text = format!("> {}", self.query);
-        for &idx in &self.filtered[self.scroll..end] {
-            text.push('\n');
-            text.push_str(&self.items[idx]);
-        }
-
-        render_text(
-            &mut self.font_system,
-            &mut self.swash_cache,
+        // Prompt row: typed query, or placeholder in muted when empty.
+        let (prompt_text, prompt_color) = if query.is_empty() {
+            (cfg.placeholder.as_str(), cfg.muted)
+        } else {
+            (query.as_str(), cfg.fg)
+        };
+        draw_text_line(
+            font_system,
+            swash_cache,
             canvas,
             width,
             height,
-            &text,
+            cfg,
+            text_x,
+            row_top(cfg, 0),
+            prompt_text,
+            prompt_color,
         );
 
-        let surface = self.layer.wl_surface();
+        // Result rows.
+        let end = (*scroll + cfg.max_visible_items).min(filtered.len());
+        for (vis, &idx) in filtered[*scroll..end].iter().enumerate() {
+            let row = vis + 1;
+            let y = row_top(cfg, row);
+            let entry = &entries[idx];
+
+            if cfg.icons_enabled {
+                if let Some(name) = &entry.icon {
+                    if let Some(icon) = icon_loader.get(name) {
+                        let iy = y + (cfg.line_height - icon.size as f32) / 2.0;
+                        blit_icon(canvas, width, height, cfg.pad_x + cfg.border_width, iy, icon);
+                    }
+                }
+            }
+
+            let selected_row = *scroll + vis == *selected;
+            let color = if selected_row { cfg.sel_fg } else { cfg.fg };
+            draw_text_line(
+                font_system, swash_cache, canvas, width, height, cfg, text_x, y, &entry.name, color,
+            );
+        }
+
+        // Rounded-corner mask + border, applied last (premultiplies alpha).
+        apply_frame(canvas, width, height, cfg.corner_radius, cfg.border_width, cfg.border);
+
+        let surface = layer.wl_surface();
         surface.attach(Some(buffer.wl_buffer()), 0, 0);
         surface.damage_buffer(0, 0, width as i32, height as i32);
         surface.frame(qh, surface.clone());
-        self.layer.commit();
+        layer.commit();
     }
-
 }
 
-fn render_text(
+#[allow(clippy::too_many_arguments)]
+fn draw_text_line(
     font_system: &mut FontSystem,
     swash_cache: &mut SwashCache,
     canvas: &mut [u8],
-    width: u32,
-    height: u32,
+    cw: u32,
+    ch: u32,
+    cfg: &Config,
+    x: f32,
+    y: f32,
     text: &str,
+    color: u32,
 ) {
-    let metrics = Metrics::new(FONT_SIZE, LINE_HEIGHT);
+    let metrics = Metrics::new(cfg.font_size, cfg.line_height);
     let mut buffer = TextBuffer::new(font_system, metrics);
     buffer.set_wrap(font_system, Wrap::None);
-    buffer.set_size(
-        font_system,
-        Some(width as f32 - 2.0 * PAD_X),
-        Some(height as f32),
-    );
-    buffer.set_text(font_system, text, Attrs::new(), Shaping::Advanced);
+    buffer.set_size(font_system, Some(cw as f32 - x - cfg.pad_x), Some(cfg.line_height));
+
+    let mut attrs = Attrs::new();
+    if let Some(fam) = &cfg.font_family {
+        attrs = attrs.family(Family::Name(fam));
+    }
+    buffer.set_text(font_system, text, attrs, Shaping::Advanced);
     buffer.shape_until_scroll(font_system, false);
 
-    let default = argb_to_text_color(FG);
-    let prompt = argb_to_text_color(PROMPT_FG);
-
-    buffer.draw(font_system, swash_cache, default, |x, y, w, h, color| {
-        // The prompt line (y within the first row) gets an accent colour. Only
-        // swap RGB — cosmic-text packs the anti-aliasing coverage into the alpha
-        // channel, so keep `color.a()` or the glyphs render as solid boxes.
-        let on_prompt_row = (y as f32) < PAD_Y + LINE_HEIGHT;
-        let color = if on_prompt_row {
-            TextColor::rgba(prompt.r(), prompt.g(), prompt.b(), color.a())
-        } else {
-            color
-        };
-        let px = x + PAD_X as i32;
-        let py = y + PAD_Y as i32;
-        blend_rect(canvas, width, height, px, py, w, h, color);
+    let col = argb_to_text_color(color);
+    buffer.draw(font_system, swash_cache, col, |gx, gy, gw, gh, c| {
+        // cosmic-text packs anti-aliasing coverage into the alpha channel; keep
+        // it (don't override `c.a()`) or glyphs render as solid boxes.
+        blend_rect(canvas, cw, ch, x as i32 + gx, y as i32 + gy, gw, gh, c);
     });
 }
 
 // ---- Desktop entries (drun mode) ----------------------------------------------
 
-/// Discover and parse XDG `.desktop` application entries, returning
-/// (display name, launch command) pairs sorted by name. Follows the freedesktop
-/// precedence rule: the first occurrence of a given desktop-file ID wins, so
-/// `$XDG_DATA_HOME` shadows the system dirs.
-fn load_desktop_entries() -> Vec<(String, String)> {
+/// Discover and parse XDG `.desktop` application entries sorted by name. Follows
+/// the freedesktop precedence rule: the first occurrence of a desktop-file ID
+/// wins, so `$XDG_DATA_HOME` shadows the system dirs.
+fn load_desktop_entries(terminal: &str) -> Vec<Entry> {
     let mut dirs: Vec<PathBuf> = Vec::new();
-
     if let Some(home) = std::env::var_os("HOME") {
         let data_home = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
@@ -380,49 +469,40 @@ fn load_desktop_entries() -> Vec<(String, String)> {
         dirs.push(PathBuf::from(d).join("applications"));
     }
 
-    // Terminal=true entries are wrapped so they get a window.
-    let terminal = std::env::var("QMENU_TERMINAL")
-        .or_else(|_| std::env::var("TERMINAL"))
-        .unwrap_or_else(|_| "xterm".to_string());
-
     let mut seen: HashSet<String> = HashSet::new();
-    let mut out: Vec<(String, String)> = Vec::new();
+    let mut out: Vec<Entry> = Vec::new();
     for dir in dirs {
-        let rd = match std::fs::read_dir(&dir) {
-            Ok(rd) => rd,
-            Err(_) => continue,
-        };
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         for entry in rd.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
                 continue;
             }
-            let id = match path.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n.to_string(),
-                None => continue,
-            };
-            // First ID wins, even if this copy is hidden/unparseable.
-            if !seen.insert(id) {
+            let Some(id) = path.file_name().and_then(|n| n.to_str()).map(String::from) else {
                 continue;
+            };
+            if !seen.insert(id) {
+                continue; // first ID wins, even if this copy is hidden/unparseable.
             }
-            if let Some(pair) = parse_desktop_entry(&path, &terminal) {
-                out.push(pair);
+            if let Some(e) = parse_desktop_entry(&path, terminal) {
+                out.push(e);
             }
         }
     }
-    out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     out
 }
 
 /// Parse a single `.desktop` file's `[Desktop Entry]` group. Returns None for
 /// non-applications, hidden/NoDisplay entries, or entries without a usable Exec.
-fn parse_desktop_entry(path: &Path, terminal: &str) -> Option<(String, String)> {
+fn parse_desktop_entry(path: &Path, terminal: &str) -> Option<Entry> {
     let content = std::fs::read_to_string(path).ok()?;
 
     let mut in_entry = false;
     let mut name: Option<String> = None;
     let mut exec: Option<String> = None;
     let mut typ: Option<String> = None;
+    let mut icon: Option<String> = None;
     let mut no_display = false;
     let mut hidden = false;
     let mut is_terminal = false;
@@ -436,29 +516,25 @@ fn parse_desktop_entry(path: &Path, terminal: &str) -> Option<(String, String)> 
         if !in_entry || line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let (key, val) = match line.split_once('=') {
-            Some(kv) => kv,
-            None => continue,
-        };
-        // Take the unlocalised key only (ignore `Name[de]` etc.).
+        let Some((key, val)) = line.split_once('=') else { continue };
         match key.trim() {
-            "Name" => name.get_or_insert_with(|| val.trim().to_string()),
-            "Exec" => exec.get_or_insert_with(|| val.trim().to_string()),
-            "Type" => typ.get_or_insert_with(|| val.trim().to_string()),
-            "NoDisplay" => {
-                no_display = val.trim().eq_ignore_ascii_case("true");
-                continue;
+            "Name" => {
+                name.get_or_insert_with(|| val.trim().to_string());
             }
-            "Hidden" => {
-                hidden = val.trim().eq_ignore_ascii_case("true");
-                continue;
+            "Exec" => {
+                exec.get_or_insert_with(|| val.trim().to_string());
             }
-            "Terminal" => {
-                is_terminal = val.trim().eq_ignore_ascii_case("true");
-                continue;
+            "Type" => {
+                typ.get_or_insert_with(|| val.trim().to_string());
             }
-            _ => continue,
-        };
+            "Icon" => {
+                icon.get_or_insert_with(|| val.trim().to_string());
+            }
+            "NoDisplay" => no_display = val.trim().eq_ignore_ascii_case("true"),
+            "Hidden" => hidden = val.trim().eq_ignore_ascii_case("true"),
+            "Terminal" => is_terminal = val.trim().eq_ignore_ascii_case("true"),
+            _ => {}
+        }
     }
 
     if no_display || hidden {
@@ -475,12 +551,12 @@ fn parse_desktop_entry(path: &Path, terminal: &str) -> Option<(String, String)> 
     if cmd.is_empty() {
         return None;
     }
-    let cmd = if is_terminal {
+    let action = if is_terminal {
         format!("{} -e {}", terminal, cmd)
     } else {
         cmd
     };
-    Some((name, cmd))
+    Some(Entry { name, action, icon })
 }
 
 /// Strip Desktop Entry field codes (`%f`, `%U`, `%i`, …) from an Exec value and
@@ -490,9 +566,8 @@ fn clean_exec(exec: &str) -> String {
     let mut chars = exec.chars();
     while let Some(c) = chars.next() {
         if c == '%' {
-            match chars.next() {
-                Some('%') => out.push('%'),
-                _ => {} // drop the field code
+            if let Some('%') = chars.next() {
+                out.push('%');
             }
         } else {
             out.push(c);
@@ -503,6 +578,15 @@ fn clean_exec(exec: &str) -> String {
 
 // ---- Pixel helpers ------------------------------------------------------------
 
+fn argb_to_text_color(c: u32) -> TextColor {
+    TextColor::rgba(
+        ((c >> 16) & 0xff) as u8,
+        ((c >> 8) & 0xff) as u8,
+        (c & 0xff) as u8,
+        ((c >> 24) & 0xff) as u8,
+    )
+}
+
 fn paint_solid(canvas: &mut [u8], argb: u32) {
     let bytes = argb.to_le_bytes(); // little-endian: [B, G, R, A] for Argb8888.
     for px in canvas.chunks_exact_mut(4) {
@@ -510,33 +594,22 @@ fn paint_solid(canvas: &mut [u8], argb: u32) {
     }
 }
 
-fn fill_rect(canvas: &mut [u8], width: u32, height: u32, x: f32, y: f32, w: f32, h: f32, argb: u32) {
-    let bytes = argb.to_le_bytes();
-    let x0 = x.max(0.0) as u32;
-    let y0 = y.max(0.0) as u32;
-    let x1 = ((x + w) as u32).min(width);
-    let y1 = ((y + h) as u32).min(height);
-    for py in y0..y1 {
-        let row = (py * width) as usize * 4;
-        for px in x0..x1 {
-            let off = row + px as usize * 4;
-            canvas[off..off + 4].copy_from_slice(&bytes);
-        }
+/// Alpha-blend a single straight-alpha colour over one canvas pixel.
+#[inline]
+fn blend_px(canvas: &mut [u8], off: usize, r: u8, g: u8, b: u8, a: u32) {
+    if a == 0 {
+        return;
     }
+    let inv = 255 - a;
+    canvas[off] = ((b as u32 * a + canvas[off] as u32 * inv) / 255) as u8;
+    canvas[off + 1] = ((g as u32 * a + canvas[off + 1] as u32 * inv) / 255) as u8;
+    canvas[off + 2] = ((r as u32 * a + canvas[off + 2] as u32 * inv) / 255) as u8;
+    canvas[off + 3] = 0xff;
 }
 
 /// Alpha-blend a coverage rect emitted by cosmic-text onto the canvas.
-fn blend_rect(
-    canvas: &mut [u8],
-    width: u32,
-    height: u32,
-    x: i32,
-    y: i32,
-    w: u32,
-    h: u32,
-    color: TextColor,
-) {
-    let (cr, cg, cb, ca) = (color.r(), color.g(), color.b(), color.a());
+fn blend_rect(canvas: &mut [u8], width: u32, height: u32, x: i32, y: i32, w: u32, h: u32, color: TextColor) {
+    let (cr, cg, cb, ca) = (color.r(), color.g(), color.b(), color.a() as u32);
     if ca == 0 {
         return;
     }
@@ -551,67 +624,128 @@ fn blend_rect(
                 continue;
             }
             let off = ((py as u32 * width + px as u32) * 4) as usize;
-            let a = ca as u32;
-            let inv = 255 - a;
-            // canvas is [B, G, R, A]
-            let db = canvas[off] as u32;
-            let dg = canvas[off + 1] as u32;
-            let dr = canvas[off + 2] as u32;
-            canvas[off] = ((cb as u32 * a + db * inv) / 255) as u8;
-            canvas[off + 1] = ((cg as u32 * a + dg * inv) / 255) as u8;
-            canvas[off + 2] = ((cr as u32 * a + dr * inv) / 255) as u8;
-            canvas[off + 3] = 0xff;
+            blend_px(canvas, off, cr, cg, cb, ca);
         }
     }
+}
+
+/// Blit a straight-alpha RGBA icon onto the canvas at (x, y).
+fn blit_icon(canvas: &mut [u8], width: u32, height: u32, x: f32, y: f32, icon: &icons::Icon) {
+    let ox = x.round() as i32;
+    let oy = y.round() as i32;
+    let s = icon.size;
+    for iy in 0..s as i32 {
+        let py = oy + iy;
+        if py < 0 || py >= height as i32 {
+            continue;
+        }
+        for ix in 0..s as i32 {
+            let px = ox + ix;
+            if px < 0 || px >= width as i32 {
+                continue;
+            }
+            let si = ((iy as u32 * s + ix as u32) * 4) as usize;
+            let (r, g, b, a) = (
+                icon.rgba[si],
+                icon.rgba[si + 1],
+                icon.rgba[si + 2],
+                icon.rgba[si + 3] as u32,
+            );
+            let off = ((py as u32 * width + px as u32) * 4) as usize;
+            blend_px(canvas, off, r, g, b, a);
+        }
+    }
+}
+
+/// Signed distance from a point to a rounded rect of size (w, h) centred in its
+/// own box, with corner radius r. Negative = inside.
+fn rr_sdf(px: f32, py: f32, w: f32, h: f32, r: f32) -> f32 {
+    let r = r.min(w / 2.0).min(h / 2.0).max(0.0);
+    let qx = (px - w / 2.0).abs() - (w / 2.0 - r);
+    let qy = (py - h / 2.0).abs() - (h / 2.0 - r);
+    let ax = qx.max(0.0);
+    let ay = qy.max(0.0);
+    (ax * ax + ay * ay).sqrt() + qx.max(qy).min(0.0) - r
+}
+
+/// Fill a rounded rect with anti-aliased edges by alpha-blending `argb` over the
+/// (assumed opaque) canvas.
+#[allow(clippy::too_many_arguments)]
+fn fill_round_rect(canvas: &mut [u8], cw: u32, ch: u32, x: f32, y: f32, w: f32, h: f32, r: f32, argb: u32) {
+    let (cr, cg, cb, base_a) = unpack(argb);
+    let x0 = x.floor().max(0.0) as u32;
+    let y0 = y.floor().max(0.0) as u32;
+    let x1 = ((x + w).ceil() as u32).min(cw);
+    let y1 = ((y + h).ceil() as u32).min(ch);
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let d = rr_sdf(px as f32 + 0.5 - x, py as f32 + 0.5 - y, w, h, r);
+            let cov = (0.5 - d).clamp(0.0, 1.0);
+            if cov <= 0.0 {
+                continue;
+            }
+            let a = (base_a as f32 * cov) as u32;
+            let off = ((py * cw + px) * 4) as usize;
+            blend_px(canvas, off, cr, cg, cb, a);
+        }
+    }
+}
+
+/// Stroke a rounded-rect border around the whole surface and make the area
+/// outside the rounded rect transparent (premultiplied), giving anti-aliased
+/// rounded corners. Run this last.
+fn apply_frame(canvas: &mut [u8], cw: u32, ch: u32, radius: f32, border_w: f32, border_argb: u32) {
+    let (br, bg, bb, ba) = unpack(border_argb);
+    let w = cw as f32;
+    let h = ch as f32;
+    let radius = radius.min(w / 2.0).min(h / 2.0).max(0.0);
+    for py in 0..ch {
+        for px in 0..cw {
+            let d = rr_sdf(px as f32 + 0.5, py as f32 + 0.5, w, h, radius);
+            // Coverage of the surface (1 inside, 0 outside, AA on the edge).
+            let outer = (0.5 - d).clamp(0.0, 1.0);
+            let off = ((py * cw + px) * 4) as usize;
+
+            // Border ring: pixels within `border_w` of the outer edge.
+            if border_w > 0.0 {
+                let ring = outer * (0.5 + d + border_w).clamp(0.0, 1.0);
+                if ring > 0.0 {
+                    let a = (ba as f32 * ring) as u32;
+                    blend_px(canvas, off, br, bg, bb, a);
+                }
+            }
+
+            // Fold the pixel's own (possibly translucent) alpha with the corner
+            // coverage, then premultiply — wl_shm Argb8888 is premultiplied, and
+            // this is what fades the corners to transparent.
+            let final_a = canvas[off + 3] as f32 * outer / 255.0;
+            let factor = final_a / 255.0;
+            canvas[off] = (canvas[off] as f32 * factor) as u8;
+            canvas[off + 1] = (canvas[off + 1] as f32 * factor) as u8;
+            canvas[off + 2] = (canvas[off + 2] as f32 * factor) as u8;
+            canvas[off + 3] = final_a as u8;
+        }
+    }
+}
+
+/// Unpack `0xAARRGGBB` into (r, g, b, a).
+fn unpack(argb: u32) -> (u8, u8, u8, u32) {
+    (
+        ((argb >> 16) & 0xff) as u8,
+        ((argb >> 8) & 0xff) as u8,
+        (argb & 0xff) as u8,
+        (argb >> 24) & 0xff,
+    )
 }
 
 // ---- Wayland handlers ---------------------------------------------------------
 
 impl CompositorHandler for Qmenu {
-    fn scale_factor_changed(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: i32,
-    ) {
-    }
-
-    fn transform_changed(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: wayland_client::protocol::wl_output::Transform,
-    ) {
-    }
-
-    fn frame(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: u32,
-    ) {
-    }
-
-    fn surface_enter(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: &wl_output::WlOutput,
-    ) {
-    }
-
-    fn surface_leave(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: &wl_output::WlOutput,
-    ) {
-    }
+    fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: i32) {}
+    fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
+    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
+    fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
+    fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
 }
 
 impl OutputHandler for Qmenu {
@@ -628,14 +762,7 @@ impl LayerShellHandler for Qmenu {
         self.exit = true;
     }
 
-    fn configure(
-        &mut self,
-        _: &Connection,
-        qh: &QueueHandle<Self>,
-        _: &LayerSurface,
-        configure: LayerSurfaceConfigure,
-        _: u32,
-    ) {
+    fn configure(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &LayerSurface, configure: LayerSurfaceConfigure, _: u32) {
         let (w, h) = configure.new_size;
         if w != 0 {
             self.width = w;
@@ -654,29 +781,14 @@ impl SeatHandler for Qmenu {
     }
     fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wayland_client::protocol::wl_seat::WlSeat) {}
 
-    fn new_capability(
-        &mut self,
-        _: &Connection,
-        qh: &QueueHandle<Self>,
-        seat: wayland_client::protocol::wl_seat::WlSeat,
-        capability: Capability,
-    ) {
+    fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wayland_client::protocol::wl_seat::WlSeat, capability: Capability) {
         if capability == Capability::Keyboard && self.keyboard.is_none() {
-            let kb = self
-                .seat_state
-                .get_keyboard(qh, &seat, None)
-                .expect("failed to obtain the keyboard");
+            let kb = self.seat_state.get_keyboard(qh, &seat, None).expect("failed to obtain the keyboard");
             self.keyboard = Some(kb);
         }
     }
 
-    fn remove_capability(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: wayland_client::protocol::wl_seat::WlSeat,
-        capability: Capability,
-    ) {
+    fn remove_capability(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wayland_client::protocol::wl_seat::WlSeat, capability: Capability) {
         if capability == Capability::Keyboard {
             if let Some(kb) = self.keyboard.take() {
                 kb.release();
@@ -688,36 +800,10 @@ impl SeatHandler for Qmenu {
 }
 
 impl KeyboardHandler for Qmenu {
-    fn enter(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: &wl_surface::WlSurface,
-        _: u32,
-        _: &[u32],
-        _: &[Keysym],
-    ) {
-    }
+    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32, _: &[u32], _: &[Keysym]) {}
+    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32) {}
 
-    fn leave(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: &wl_surface::WlSurface,
-        _: u32,
-    ) {
-    }
-
-    fn press_key(
-        &mut self,
-        _: &Connection,
-        qh: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: u32,
-        event: KeyEvent,
-    ) {
+    fn press_key(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, event: KeyEvent) {
         let ctrl = self.modifiers.ctrl;
         match event.keysym {
             Keysym::Escape => {
@@ -734,8 +820,8 @@ impl KeyboardHandler for Qmenu {
             }
             Keysym::Up => self.move_selection(-1),
             Keysym::Down => self.move_selection(1),
-            Keysym::Page_Up => self.move_selection(-(MAX_VISIBLE_ITEMS as isize)),
-            Keysym::Page_Down => self.move_selection(MAX_VISIBLE_ITEMS as isize),
+            Keysym::Page_Up => self.move_selection(-(self.config.max_visible_items as isize)),
+            Keysym::Page_Down => self.move_selection(self.config.max_visible_items as isize),
             _ if ctrl => match event.keysym {
                 Keysym::p => self.move_selection(-1),
                 Keysym::n => self.move_selection(1),
@@ -769,28 +855,12 @@ impl KeyboardHandler for Qmenu {
                 }
             }
         }
-        self.draw(qh);
+        self.relayout_and_draw(qh);
     }
 
-    fn release_key(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: u32,
-        _: KeyEvent,
-    ) {
-    }
+    fn release_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, _: KeyEvent) {}
 
-    fn update_modifiers(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: u32,
-        modifiers: Modifiers,
-        _: u32,
-    ) {
+    fn update_modifiers(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, modifiers: Modifiers, _: u32) {
         self.modifiers = modifiers;
     }
 }

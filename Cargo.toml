@@ -12,6 +12,11 @@ path = "src/main.rs"
 smithay-client-toolkit = "0.19"
 wayland-client = "0.31"
 cosmic-text = "0.12"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+# Icon decoding: raster (PNG) via `image`, vector (SVG) via `resvg`.
+image = { version = "0.25", default-features = false, features = ["png"] }
+resvg = "0.44"
 
 [profile.release]
 opt-level = 2

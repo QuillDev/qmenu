@@ -1,4 +1,14 @@
-{ pkgs ? import <nixpkgs> { } }:
+# `settings` (optional) is a Nix attrset matching config.toml's schema. When
+# given, it is serialised to TOML and baked in as a packaged default theme via
+# QMENU_DEFAULT_CONFIG, which the user's own ~/.config/qmenu/config.toml still
+# overrides. Override per-build with `.override { settings = { ... }; }`.
+{ pkgs ? import <nixpkgs> { }, settings ? null }:
+
+let
+  configFile =
+    if settings == null then null
+    else (pkgs.formats.toml { }).generate "qmenu-config.toml" settings;
+in
 
 pkgs.rustPlatform.buildRustPackage {
   pname = "qmenu";
@@ -36,7 +46,9 @@ pkgs.rustPlatform.buildRustPackage {
         libxkbcommon
         fontconfig
         freetype
-      ])}
+      ])} \
+      ${pkgs.lib.optionalString (configFile != null)
+        "--set-default QMENU_DEFAULT_CONFIG ${configFile}"}
   '';
 
   meta = with pkgs.lib; {
