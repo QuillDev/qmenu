@@ -113,14 +113,11 @@ fn main() {
     // centre us horizontally; the concrete width comes from the output below.
     let surface = compositor.create_surface(&qh);
     let layer = layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("qmenu"), None);
-    // "top": anchored near the top with margin_top. "center" (default): no
-    // vertical anchor, so the compositor centres the bar in the screen.
-    if config.anchor == "top" {
-        layer.set_anchor(Anchor::TOP);
-        layer.set_margin(config.margin_top, 0, 0, 0);
-    } else {
-        layer.set_anchor(Anchor::empty());
-    }
+    // Always anchor the TOP edge so results grow downward (the prompt stays put)
+    // rather than the box re-centring and pushing up. The concrete top margin is
+    // computed after the roundtrip below: `margin_top` for "top", or whatever
+    // centres the collapsed bar for "center".
+    layer.set_anchor(Anchor::TOP);
     layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
 
     let icon_loader = IconLoader::new(config.icon_size, config.icon_theme.clone());
@@ -166,7 +163,7 @@ fn main() {
     event_queue
         .roundtrip(&mut state)
         .expect("initial Wayland roundtrip failed");
-    let screen_width = state
+    let (screen_width, screen_height) = state
         .output_state
         .outputs()
         .filter_map(|o| state.output_state.info(&o))
@@ -174,12 +171,24 @@ fn main() {
             i.logical_size
                 .or_else(|| i.modes.iter().find(|m| m.current).map(|m| m.dimensions))
         })
-        .map(|(w, _)| w as u32)
-        .max()
-        .unwrap_or(FALLBACK_SCREEN_WIDTH);
+        .max_by_key(|(w, _)| *w)
+        .map(|(w, h)| (w as u32, h as u32))
+        .unwrap_or((FALLBACK_SCREEN_WIDTH, 1080));
     let bar_width = ((screen_width as f32 * state.config.width_fraction) as u32)
         .max(state.config.min_width)
         .min(2200);
+
+    // Pin the top edge. "top": a fixed gap. "center": position the *collapsed*
+    // (prompt-only) bar at the vertical centre so it looks centred, then let
+    // results extend downward without moving the prompt.
+    let cfg = &state.config;
+    let collapsed = (cfg.line_height + 2.0 * (cfg.pad_y + cfg.border_width)).ceil() as u32;
+    let margin_top = if cfg.anchor == "top" {
+        cfg.margin_top
+    } else {
+        (screen_height.saturating_sub(collapsed) / 2) as i32
+    };
+    state.layer.set_margin(margin_top, 0, 0, 0);
     state.width = bar_width;
     state.height = state.content_height();
     state.layer.set_size(state.width, state.height);
