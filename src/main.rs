@@ -140,7 +140,8 @@ fn main() {
         + panel_pad)
         .ceil() as u32;
     let pool_cap = (2200 * max_height.max(1) * 4) as usize;
-    let pool = SlotPool::new(pool_cap.max(256 * 256 * 4), &shm).expect("failed to create a buffer pool");
+    let pool =
+        SlotPool::new(pool_cap.max(256 * 256 * 4), &shm).expect("failed to create a buffer pool");
 
     let mut state = Qmenu {
         registry_state: RegistryState::new(&globals),
@@ -172,6 +173,10 @@ fn main() {
 
         exit: false,
         result: None,
+
+        anim_h: 0.0,
+        last_frame_time: None,
+        frame_pending: false,
     };
     state.recompute_filter();
 
@@ -189,8 +194,7 @@ fn main() {
                 .or_else(|| i.modes.iter().find(|m| m.current).map(|m| m.dimensions))
         })
         .max_by_key(|(w, _)| *w)
-        .map(|(w, h)| (w as u32, h as u32))
-        .unwrap_or((FALLBACK_SCREEN_WIDTH, 1080));
+        .map_or((FALLBACK_SCREEN_WIDTH, 1080), |(w, h)| (w as u32, h as u32));
     let bar_width = ((screen_width as f32 * state.config.width_fraction) as u32)
         .max(state.config.min_width)
         .min(2200);
@@ -224,7 +228,7 @@ fn main() {
     }
 
     if let Some(choice) = state.result {
-        let _ = writeln!(std::io::stdout(), "{}", choice);
+        let _ = writeln!(std::io::stdout(), "{choice}");
     } else {
         std::process::exit(1);
     }
@@ -275,6 +279,12 @@ struct Qmenu {
 
     exit: bool,
     result: Option<String>,
+
+    // Drawer animation: `anim_h` is the currently-rendered results-panel height,
+    // eased toward the target height each frame callback.
+    anim_h: f32,
+    last_frame_time: Option<u32>,
+    frame_pending: bool,
 }
 
 impl Qmenu {
@@ -305,16 +315,14 @@ impl Qmenu {
         self.query[..self.cursor]
             .char_indices()
             .last()
-            .map(|(i, _)| i)
-            .unwrap_or(0)
+            .map_or(0, |(i, _)| i)
     }
 
     fn next_boundary(&self) -> usize {
         self.query[self.cursor..]
             .chars()
             .next()
-            .map(|c| self.cursor + c.len_utf8())
-            .unwrap_or(self.cursor)
+            .map_or(self.cursor, |c| self.cursor + c.len_utf8())
     }
 
     /// Start of the word before the cursor (skips trailing whitespace, then the
@@ -328,7 +336,7 @@ impl Qmenu {
         while k > 0 && !chars[k - 1].1.is_whitespace() {
             k -= 1;
         }
-        chars.get(k).map(|(i, _)| *i).unwrap_or(0)
+        chars.get(k).map_or(0, |(i, _)| *i)
     }
 
     /// End of the word after the cursor (skips leading whitespace, then the word).
@@ -341,7 +349,9 @@ impl Qmenu {
         while j < chars.len() && !chars[j].1.is_whitespace() {
             j += 1;
         }
-        chars.get(j).map(|(i, _)| self.cursor + *i).unwrap_or(self.query.len())
+        chars
+            .get(j)
+            .map_or(self.query.len(), |(i, _)| self.cursor + *i)
     }
 
     fn backspace(&mut self) {
@@ -380,6 +390,37 @@ impl Qmenu {
         self.draw(qh);
     }
 
+    /// Target height of the results panel for the current matches (0 when none).
+    fn target_results_h(&self) -> f32 {
+        let cfg = &self.config;
+        let nvis = (self.scroll + cfg.max_visible_items).min(self.filtered.len()) - self.scroll;
+        if nvis == 0 {
+            0.0
+        } else {
+            nvis as f32 * cfg.line_height + 2.0 * (cfg.pad_y + cfg.border_width)
+        }
+    }
+
+    /// Ease the drawer height toward its target using frame time `now` (ms).
+    fn advance_anim(&mut self, now: u32) {
+        let target = self.target_results_h();
+        if !self.config.animate {
+            self.anim_h = target;
+            return;
+        }
+        let dt = self.last_frame_time.map_or(0.0, |prev| {
+            (now.wrapping_sub(prev) as f32 / 1000.0).clamp(0.0, 0.1)
+        });
+        self.last_frame_time = Some(now);
+        let tau = (self.config.animation_ms / 1000.0).max(0.001);
+        let k = 1.0 - (-dt / tau).exp();
+        self.anim_h += (target - self.anim_h) * k;
+        if (self.anim_h - target).abs() < 0.5 {
+            self.anim_h = target;
+            self.last_frame_time = None; // reset so the next animation starts fresh
+        }
+    }
+
     fn move_selection(&mut self, delta: isize) {
         if self.filtered.is_empty() {
             return;
@@ -414,7 +455,7 @@ impl Qmenu {
         let stride = width as i32 * 4;
 
         // Disjoint borrows so the helpers can take canvas + font/icon state.
-        let Qmenu {
+        let Self {
             pool,
             layer,
             font_system,
@@ -427,12 +468,19 @@ impl Qmenu {
             cursor,
             selected,
             scroll,
+            anim_h,
+            frame_pending,
             ..
         } = self;
         let cfg = &*config;
 
         let (buffer, canvas) = pool
-            .create_buffer(width as i32, height as i32, stride, wl_shm::Format::Argb8888)
+            .create_buffer(
+                width as i32,
+                height as i32,
+                stride,
+                wl_shm::Format::Argb8888,
+            )
             .expect("failed to create a drawing buffer");
 
         // Transparent canvas: panels paint their own rounded shapes onto it, and
@@ -451,7 +499,16 @@ impl Qmenu {
 
         // --- Prompt panel: a constant rounded drawer that never changes shape. --
         draw_panel(
-            canvas, width, height, 0.0, 0.0, width as f32, prompt_h, cfg.corner_radius, bw, cfg.bg,
+            canvas,
+            width,
+            height,
+            0.0,
+            0.0,
+            width as f32,
+            prompt_h,
+            cfg.corner_radius,
+            bw,
+            cfg.bg,
             cfg.border,
         );
 
@@ -462,8 +519,17 @@ impl Qmenu {
             (query.as_str(), cfg.fg)
         };
         draw_text_line(
-            font_system, swash_cache, canvas, width, height, cfg, text_x, prompt_y, prompt_text,
+            font_system,
+            swash_cache,
+            canvas,
+            width,
+            height,
+            cfg,
+            text_x,
+            prompt_y,
+            prompt_text,
             prompt_color,
+            i32::MAX,
         );
 
         // Solid caret at the cursor position in the prompt row.
@@ -481,16 +547,35 @@ impl Qmenu {
         );
 
         // --- Results panel: a separate drawer that slides out below the prompt. -
+        // Its height is animated (`anim_h`); the target is the full height for the
+        // current matches. Content is clipped to the animated height so rows are
+        // revealed/hidden as the drawer grows and shrinks.
         let end = (*scroll + cfg.max_visible_items).min(filtered.len());
-        let nvis = end - *scroll;
-        if nvis > 0 {
+        let target_h = if end > *scroll {
+            (end - *scroll) as f32 * cfg.line_height + panel_pad
+        } else {
+            0.0
+        };
+        let draw_h = if cfg.animate { *anim_h } else { target_h };
+
+        if draw_h > 1.0 {
             let ry = prompt_h + cfg.result_gap;
-            let results_h = nvis as f32 * cfg.line_height + panel_pad;
             draw_panel(
-                canvas, width, height, 0.0, ry, width as f32, results_h, cfg.corner_radius, bw,
-                cfg.bg, cfg.border,
+                canvas,
+                width,
+                height,
+                0.0,
+                ry,
+                width as f32,
+                draw_h,
+                cfg.corner_radius,
+                bw,
+                cfg.bg,
+                cfg.border,
             );
 
+            // Clip content to the drawn (animated) panel interior.
+            let clip_y1 = (ry + draw_h - bw).round() as i32;
             let rows_top = ry + bw + cfg.pad_y;
 
             // Selection highlight (rounded), behind the selected row.
@@ -507,25 +592,42 @@ impl Qmenu {
                 cfg.line_height - 2.0,
                 cfg.row_radius,
                 cfg.sel_bg,
+                clip_y1,
             );
 
             for (vis, &idx) in filtered[*scroll..end].iter().enumerate() {
                 let y = rows_top + vis as f32 * cfg.line_height;
+                if y >= clip_y1 as f32 {
+                    break; // fully below the revealed area
+                }
                 let entry = &entries[idx];
 
                 if cfg.icons_enabled {
                     if let Some(name) = &entry.icon {
                         if let Some(icon) = icon_loader.get(name) {
                             let iy = y + (cfg.line_height - icon.size as f32) / 2.0;
-                            blit_icon(canvas, width, height, cfg.pad_x + bw, iy, icon);
+                            blit_icon(canvas, width, height, cfg.pad_x + bw, iy, icon, clip_y1);
                         }
                     }
                 }
 
-                let color = if *scroll + vis == *selected { cfg.sel_fg } else { cfg.fg };
+                let color = if *scroll + vis == *selected {
+                    cfg.sel_fg
+                } else {
+                    cfg.fg
+                };
                 draw_text_line(
-                    font_system, swash_cache, canvas, width, height, cfg, text_x, y, &entry.name,
+                    font_system,
+                    swash_cache,
+                    canvas,
+                    width,
+                    height,
+                    cfg,
+                    text_x,
+                    y,
+                    &entry.name,
                     color,
+                    clip_y1,
                 );
             }
         }
@@ -536,7 +638,12 @@ impl Qmenu {
         let surface = layer.wl_surface();
         surface.attach(Some(buffer.wl_buffer()), 0, 0);
         surface.damage_buffer(0, 0, width as i32, height as i32);
-        surface.frame(qh, surface.clone());
+        // Keep frames coming only while the drawer is still animating, so the
+        // loop stays idle otherwise.
+        if cfg.animate && (*anim_h - target_h).abs() > 0.5 && !*frame_pending {
+            surface.frame(qh, surface.clone());
+            *frame_pending = true;
+        }
         layer.commit();
     }
 }
@@ -553,11 +660,16 @@ fn draw_text_line(
     y: f32,
     text: &str,
     color: u32,
+    clip_y1: i32,
 ) {
     let metrics = Metrics::new(cfg.font_size, cfg.line_height);
     let mut buffer = TextBuffer::new(font_system, metrics);
     buffer.set_wrap(font_system, Wrap::None);
-    buffer.set_size(font_system, Some(cw as f32 - x - cfg.pad_x), Some(cfg.line_height));
+    buffer.set_size(
+        font_system,
+        Some(cw as f32 - x - cfg.pad_x),
+        Some(cfg.line_height),
+    );
 
     let mut attrs = Attrs::new();
     if let Some(fam) = &cfg.font_family {
@@ -570,7 +682,17 @@ fn draw_text_line(
     buffer.draw(font_system, swash_cache, col, |gx, gy, gw, gh, c| {
         // cosmic-text packs anti-aliasing coverage into the alpha channel; keep
         // it (don't override `c.a()`) or glyphs render as solid boxes.
-        blend_rect(canvas, cw, ch, x as i32 + gx, y as i32 + gy, gw, gh, c);
+        blend_rect(
+            canvas,
+            cw,
+            ch,
+            x as i32 + gx,
+            y as i32 + gy,
+            gw,
+            gh,
+            c,
+            clip_y1,
+        );
     });
 }
 
@@ -604,8 +726,7 @@ fn load_desktop_entries(terminal: &str) -> Vec<Entry> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {
         let data_home = std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(&home).join(".local/share"));
+            .map_or_else(|| PathBuf::from(&home).join(".local/share"), PathBuf::from);
         dirs.push(data_home.join("applications"));
     }
     let data_dirs = std::env::var("XDG_DATA_DIRS")
@@ -617,7 +738,9 @@ fn load_desktop_entries(terminal: &str) -> Vec<Entry> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<Entry> = Vec::new();
     for dir in dirs {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in rd.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
@@ -634,7 +757,7 @@ fn load_desktop_entries(terminal: &str) -> Vec<Entry> {
             }
         }
     }
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.sort_by_key(|e| e.name.to_lowercase());
     out
 }
 
@@ -661,7 +784,9 @@ fn parse_desktop_entry(path: &Path, terminal: &str) -> Option<Entry> {
         if !in_entry || line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let Some((key, val)) = line.split_once('=') else { continue };
+        let Some((key, val)) = line.split_once('=') else {
+            continue;
+        };
         match key.trim() {
             "Name" => {
                 name.get_or_insert_with(|| val.trim().to_string());
@@ -697,7 +822,7 @@ fn parse_desktop_entry(path: &Path, terminal: &str) -> Option<Entry> {
         return None;
     }
     let action = if is_terminal {
-        format!("{} -e {}", terminal, cmd)
+        format!("{terminal} -e {cmd}")
     } else {
         cmd
     };
@@ -711,7 +836,7 @@ fn clean_exec(exec: &str) -> String {
     let mut chars = exec.chars();
     while let Some(c) = chars.next() {
         if c == '%' {
-            if let Some('%') = chars.next() {
+            if chars.next() == Some('%') {
                 out.push('%');
             }
         } else {
@@ -723,7 +848,7 @@ fn clean_exec(exec: &str) -> String {
 
 // ---- Pixel helpers ------------------------------------------------------------
 
-fn argb_to_text_color(c: u32) -> TextColor {
+const fn argb_to_text_color(c: u32) -> TextColor {
     TextColor::rgba(
         ((c >> 16) & 0xff) as u8,
         ((c >> 8) & 0xff) as u8,
@@ -755,7 +880,7 @@ fn fill_solid(canvas: &mut [u8], cw: u32, ch: u32, x: f32, y: f32, w: f32, h: f3
 }
 
 /// Multiply every pixel's RGB by its alpha, converting the straight-alpha canvas
-/// the rest of the drawing code builds into the premultiplied form wl_shm wants.
+/// the rest of the drawing code builds into the premultiplied form `wl_shm` wants.
 fn premultiply(canvas: &mut [u8]) {
     for px in canvas.chunks_exact_mut(4) {
         let a = px[3] as u32;
@@ -844,15 +969,27 @@ fn blend_px(canvas: &mut [u8], off: usize, r: u8, g: u8, b: u8, a: u32) {
     canvas[off + 3] = 0xff;
 }
 
-/// Alpha-blend a coverage rect emitted by cosmic-text onto the canvas.
-fn blend_rect(canvas: &mut [u8], width: u32, height: u32, x: i32, y: i32, w: u32, h: u32, color: TextColor) {
+/// Alpha-blend a coverage rect emitted by cosmic-text onto the canvas, skipping
+/// rows at or below `clip_y1`.
+#[allow(clippy::too_many_arguments)]
+fn blend_rect(
+    canvas: &mut [u8],
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    color: TextColor,
+    clip_y1: i32,
+) {
     let (cr, cg, cb, ca) = (color.r(), color.g(), color.b(), color.a() as u32);
     if ca == 0 {
         return;
     }
     for dy in 0..h as i32 {
         let py = y + dy;
-        if py < 0 || py >= height as i32 {
+        if py < 0 || py >= height as i32 || py >= clip_y1 {
             continue;
         }
         for dx in 0..w as i32 {
@@ -866,14 +1003,24 @@ fn blend_rect(canvas: &mut [u8], width: u32, height: u32, x: i32, y: i32, w: u32
     }
 }
 
-/// Blit a straight-alpha RGBA icon onto the canvas at (x, y).
-fn blit_icon(canvas: &mut [u8], width: u32, height: u32, x: f32, y: f32, icon: &icons::Icon) {
+/// Blit a straight-alpha RGBA icon onto the canvas at (x, y), skipping rows at or
+/// below `clip_y1`.
+#[allow(clippy::too_many_arguments)]
+fn blit_icon(
+    canvas: &mut [u8],
+    width: u32,
+    height: u32,
+    x: f32,
+    y: f32,
+    icon: &icons::Icon,
+    clip_y1: i32,
+) {
     let ox = x.round() as i32;
     let oy = y.round() as i32;
     let s = icon.size;
     for iy in 0..s as i32 {
         let py = oy + iy;
-        if py < 0 || py >= height as i32 {
+        if py < 0 || py >= height as i32 || py >= clip_y1 {
             continue;
         }
         for ix in 0..s as i32 {
@@ -908,12 +1055,23 @@ fn rr_sdf(px: f32, py: f32, w: f32, h: f32, r: f32) -> f32 {
 /// Fill a rounded rect with anti-aliased edges by alpha-blending `argb` over the
 /// (assumed opaque) canvas.
 #[allow(clippy::too_many_arguments)]
-fn fill_round_rect(canvas: &mut [u8], cw: u32, ch: u32, x: f32, y: f32, w: f32, h: f32, r: f32, argb: u32) {
+fn fill_round_rect(
+    canvas: &mut [u8],
+    cw: u32,
+    ch: u32,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    r: f32,
+    argb: u32,
+    clip_y1: i32,
+) {
     let (cr, cg, cb, base_a) = unpack(argb);
     let x0 = x.floor().max(0.0) as u32;
     let y0 = y.floor().max(0.0) as u32;
     let x1 = ((x + w).ceil() as u32).min(cw);
-    let y1 = ((y + h).ceil() as u32).min(ch);
+    let y1 = ((y + h).ceil() as u32).min(ch).min(clip_y1.max(0) as u32);
     for py in y0..y1 {
         for px in x0..x1 {
             let d = rr_sdf(px as f32 + 0.5 - x, py as f32 + 0.5 - y, w, h, r);
@@ -929,7 +1087,7 @@ fn fill_round_rect(canvas: &mut [u8], cw: u32, ch: u32, x: f32, y: f32, w: f32, 
 }
 
 /// Unpack `0xAARRGGBB` into (r, g, b, a).
-fn unpack(argb: u32) -> (u8, u8, u8, u32) {
+const fn unpack(argb: u32) -> (u8, u8, u8, u32) {
     (
         ((argb >> 16) & 0xff) as u8,
         ((argb >> 8) & 0xff) as u8,
@@ -941,11 +1099,51 @@ fn unpack(argb: u32) -> (u8, u8, u8, u32) {
 // ---- Wayland handlers ---------------------------------------------------------
 
 impl CompositorHandler for Qmenu {
-    fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: i32) {}
-    fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
-    fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
-    fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
+    fn scale_factor_changed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: i32,
+    ) {
+    }
+    fn transform_changed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: wl_output::Transform,
+    ) {
+    }
+    fn frame(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        time: u32,
+    ) {
+        // The previously-requested frame callback fired; advance the drawer
+        // animation and redraw (which re-requests a frame while still animating).
+        self.frame_pending = false;
+        self.advance_anim(time);
+        self.draw(qh);
+    }
+    fn surface_enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: &wl_output::WlOutput,
+    ) {
+    }
+    fn surface_leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: &wl_output::WlOutput,
+    ) {
+    }
 }
 
 impl OutputHandler for Qmenu {
@@ -962,7 +1160,14 @@ impl LayerShellHandler for Qmenu {
         self.exit = true;
     }
 
-    fn configure(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &LayerSurface, configure: LayerSurfaceConfigure, _: u32) {
+    fn configure(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        _: &LayerSurface,
+        configure: LayerSurfaceConfigure,
+        _: u32,
+    ) {
         let (w, h) = configure.new_size;
         if w != 0 {
             self.width = w;
@@ -979,16 +1184,37 @@ impl SeatHandler for Qmenu {
     fn seat_state(&mut self) -> &mut SeatState {
         &mut self.seat_state
     }
-    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wayland_client::protocol::wl_seat::WlSeat) {}
+    fn new_seat(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: wayland_client::protocol::wl_seat::WlSeat,
+    ) {
+    }
 
-    fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wayland_client::protocol::wl_seat::WlSeat, capability: Capability) {
+    fn new_capability(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wayland_client::protocol::wl_seat::WlSeat,
+        capability: Capability,
+    ) {
         if capability == Capability::Keyboard && self.keyboard.is_none() {
-            let kb = self.seat_state.get_keyboard(qh, &seat, None).expect("failed to obtain the keyboard");
+            let kb = self
+                .seat_state
+                .get_keyboard(qh, &seat, None)
+                .expect("failed to obtain the keyboard");
             self.keyboard = Some(kb);
         }
     }
 
-    fn remove_capability(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wayland_client::protocol::wl_seat::WlSeat, capability: Capability) {
+    fn remove_capability(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: wayland_client::protocol::wl_seat::WlSeat,
+        capability: Capability,
+    ) {
         if capability == Capability::Keyboard {
             if let Some(kb) = self.keyboard.take() {
                 kb.release();
@@ -996,14 +1222,45 @@ impl SeatHandler for Qmenu {
         }
     }
 
-    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wayland_client::protocol::wl_seat::WlSeat) {}
+    fn remove_seat(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: wayland_client::protocol::wl_seat::WlSeat,
+    ) {
+    }
 }
 
 impl KeyboardHandler for Qmenu {
-    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32, _: &[u32], _: &[Keysym]) {}
-    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32) {}
+    fn enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: &wl_surface::WlSurface,
+        _: u32,
+        _: &[u32],
+        _: &[Keysym],
+    ) {
+    }
+    fn leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+    }
 
-    fn press_key(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, event: KeyEvent) {
+    fn press_key(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        event: KeyEvent,
+    ) {
         let ctrl = self.modifiers.ctrl;
         let alt = self.modifiers.alt;
         let word = ctrl || alt; // modifier for word-wise motion / deletion
@@ -1025,10 +1282,18 @@ impl KeyboardHandler for Qmenu {
 
             // Cursor motion within the query (word-wise with Ctrl/Alt).
             Keysym::Left => {
-                self.cursor = if word { self.prev_word() } else { self.prev_boundary() }
+                self.cursor = if word {
+                    self.prev_word()
+                } else {
+                    self.prev_boundary()
+                }
             }
             Keysym::Right => {
-                self.cursor = if word { self.next_word() } else { self.next_boundary() }
+                self.cursor = if word {
+                    self.next_word()
+                } else {
+                    self.next_boundary()
+                }
             }
             Keysym::Home => self.cursor = 0,
             Keysym::End => self.cursor = self.query.len(),
@@ -1104,9 +1369,25 @@ impl KeyboardHandler for Qmenu {
         self.relayout_and_draw(qh);
     }
 
-    fn release_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, _: KeyEvent) {}
+    fn release_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        _: KeyEvent,
+    ) {
+    }
 
-    fn update_modifiers(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, modifiers: Modifiers, _: u32) {
+    fn update_modifiers(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        modifiers: Modifiers,
+        _: u32,
+    ) {
         self.modifiers = modifiers;
     }
 }

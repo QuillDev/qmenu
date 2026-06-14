@@ -21,58 +21,62 @@ use serde::Deserialize;
 /// Fully-resolved configuration used by the rest of the program. Colours are
 /// stored as `0xAARRGGBB`.
 #[derive(Clone)]
-pub struct Config {
+pub(crate) struct Config {
     // Colours.
-    pub bg: u32,
-    pub fg: u32,
-    pub prompt: u32,
-    pub sel_bg: u32,
-    pub sel_fg: u32,
-    pub muted: u32,
-    pub border: u32,
+    pub(crate) bg: u32,
+    pub(crate) fg: u32,
+    pub(crate) prompt: u32,
+    pub(crate) sel_bg: u32,
+    pub(crate) sel_fg: u32,
+    pub(crate) muted: u32,
+    pub(crate) border: u32,
 
     // Layout / geometry.
-    pub width_fraction: f32,
-    pub min_width: u32,
-    pub margin_top: i32,
-    pub max_visible_items: usize,
-    pub font_size: f32,
-    pub line_height: f32,
-    pub pad_x: f32,
-    pub pad_y: f32,
-    pub corner_radius: f32,
-    pub border_width: f32,
-    pub row_radius: f32,
+    pub(crate) width_fraction: f32,
+    pub(crate) min_width: u32,
+    pub(crate) margin_top: i32,
+    pub(crate) max_visible_items: usize,
+    pub(crate) font_size: f32,
+    pub(crate) line_height: f32,
+    pub(crate) pad_x: f32,
+    pub(crate) pad_y: f32,
+    pub(crate) corner_radius: f32,
+    pub(crate) border_width: f32,
+    pub(crate) row_radius: f32,
     /// Gap between the prompt panel and the results panel (px).
-    pub result_gap: f32,
-    pub font_family: Option<String>,
+    pub(crate) result_gap: f32,
+    pub(crate) font_family: Option<String>,
     /// Vertical placement: "center" (default) or "top" (uses `margin_top`).
-    pub anchor: String,
+    pub(crate) anchor: String,
 
     // Icons.
-    pub icons_enabled: bool,
-    pub icon_size: u32,
-    pub icon_gap: f32,
-    pub icon_theme: Option<String>,
+    pub(crate) icons_enabled: bool,
+    pub(crate) icon_size: u32,
+    pub(crate) icon_gap: f32,
+    pub(crate) icon_theme: Option<String>,
 
     // Behaviour.
-    pub show_all_when_empty: bool,
-    pub placeholder: String,
-    pub terminal: String,
+    pub(crate) show_all_when_empty: bool,
+    pub(crate) placeholder: String,
+    pub(crate) terminal: String,
+    /// Animate the results drawer growing/shrinking.
+    pub(crate) animate: bool,
+    /// Smoothing time constant for the drawer animation, in ms (smaller = snappier).
+    pub(crate) animation_ms: f32,
 }
 
 impl Default for Config {
     fn default() -> Self {
         // Neutral dark default theme (Catppuccin-ish) with a blue accent. The
         // bundled flake overrides these to match the user's desktop.
-        Config {
-            bg: 0xf21e1e2e,
-            fg: 0xffcdd6f4,
-            prompt: 0xff89b4fa,
-            sel_bg: 0xff89b4fa,
-            sel_fg: 0xff11111b,
-            muted: 0xff9399b2,
-            border: 0xff89b4fa,
+        Self {
+            bg: 0xf21e_1e2e,
+            fg: 0xffcd_d6f4,
+            prompt: 0xff89_b4fa,
+            sel_bg: 0xff89_b4fa,
+            sel_fg: 0xff11_111b,
+            muted: 0xff93_99b2,
+            border: 0xff89_b4fa,
 
             width_fraction: 0.45,
             min_width: 480,
@@ -97,6 +101,8 @@ impl Default for Config {
             show_all_when_empty: false,
             placeholder: "Search…".to_string(),
             terminal: "xterm".to_string(),
+            animate: true,
+            animation_ms: 55.0,
         }
     }
 }
@@ -105,9 +111,13 @@ impl Config {
     /// Load configuration, applying the file found via `explicit` / env / XDG on
     /// top of the built-in defaults. Returns defaults (and warns on stderr) if a
     /// file is present but unparseable.
-    pub fn load(explicit: Option<PathBuf>) -> Config {
-        let mut cfg = Config::default();
-        let env_path = |var: &str| std::env::var_os(var).map(PathBuf::from).filter(|p| p.exists());
+    pub(crate) fn load(explicit: Option<PathBuf>) -> Self {
+        let mut cfg = Self::default();
+        let env_path = |var: &str| {
+            std::env::var_os(var)
+                .map(PathBuf::from)
+                .filter(|p| p.exists())
+        };
         let path = explicit
             .filter(|p| p.exists())
             .or_else(|| env_path("QMENU_CONFIG"))
@@ -115,9 +125,8 @@ impl Config {
             .or_else(|| env_path("QMENU_DEFAULT_CONFIG"));
 
         let Some(path) = path else { return cfg };
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(_) => return cfg,
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return cfg;
         };
         let raw: RawConfig = match toml::from_str(&text) {
             Ok(r) => r,
@@ -196,11 +205,15 @@ struct RawBehavior {
     show_all_when_empty: Option<bool>,
     placeholder: Option<String>,
     terminal: Option<String>,
+    animate: Option<bool>,
+    animation_ms: Option<f32>,
 }
 
 impl RawConfig {
     fn apply(self, c: &mut Config) {
-        let col = |opt: Option<String>, fallback: u32| opt.and_then(|s| parse_color(&s)).unwrap_or(fallback);
+        let col = |opt: Option<String>, fallback: u32| {
+            opt.and_then(|s| parse_color(&s)).unwrap_or(fallback)
+        };
 
         c.bg = col(self.colors.background, c.bg);
         c.fg = col(self.colors.foreground, c.fg);
@@ -211,42 +224,90 @@ impl RawConfig {
         c.border = col(self.colors.border, c.border);
 
         let l = self.layout;
-        if let Some(v) = l.width_fraction { c.width_fraction = v; }
-        if let Some(v) = l.min_width { c.min_width = v; }
-        if let Some(v) = l.margin_top { c.margin_top = v; }
-        if let Some(v) = l.max_visible_items { c.max_visible_items = v.max(1); }
-        if let Some(v) = l.font_size { c.font_size = v; }
-        if let Some(v) = l.line_height { c.line_height = v; }
-        if let Some(v) = l.pad_x { c.pad_x = v; }
-        if let Some(v) = l.pad_y { c.pad_y = v; }
-        if let Some(v) = l.corner_radius { c.corner_radius = v; }
-        if let Some(v) = l.border_width { c.border_width = v; }
-        if let Some(v) = l.row_radius { c.row_radius = v; }
-        if let Some(v) = l.result_gap { c.result_gap = v; }
-        if l.font_family.is_some() { c.font_family = l.font_family; }
-        if let Some(v) = l.anchor { c.anchor = v; }
+        if let Some(v) = l.width_fraction {
+            c.width_fraction = v;
+        }
+        if let Some(v) = l.min_width {
+            c.min_width = v;
+        }
+        if let Some(v) = l.margin_top {
+            c.margin_top = v;
+        }
+        if let Some(v) = l.max_visible_items {
+            c.max_visible_items = v.max(1);
+        }
+        if let Some(v) = l.font_size {
+            c.font_size = v;
+        }
+        if let Some(v) = l.line_height {
+            c.line_height = v;
+        }
+        if let Some(v) = l.pad_x {
+            c.pad_x = v;
+        }
+        if let Some(v) = l.pad_y {
+            c.pad_y = v;
+        }
+        if let Some(v) = l.corner_radius {
+            c.corner_radius = v;
+        }
+        if let Some(v) = l.border_width {
+            c.border_width = v;
+        }
+        if let Some(v) = l.row_radius {
+            c.row_radius = v;
+        }
+        if let Some(v) = l.result_gap {
+            c.result_gap = v;
+        }
+        if l.font_family.is_some() {
+            c.font_family = l.font_family;
+        }
+        if let Some(v) = l.anchor {
+            c.anchor = v;
+        }
 
         let i = self.icons;
-        if let Some(v) = i.enabled { c.icons_enabled = v; }
-        if let Some(v) = i.size { c.icon_size = v; }
-        if let Some(v) = i.gap { c.icon_gap = v; }
-        if i.theme.is_some() { c.icon_theme = i.theme; }
+        if let Some(v) = i.enabled {
+            c.icons_enabled = v;
+        }
+        if let Some(v) = i.size {
+            c.icon_size = v;
+        }
+        if let Some(v) = i.gap {
+            c.icon_gap = v;
+        }
+        if i.theme.is_some() {
+            c.icon_theme = i.theme;
+        }
 
         let b = self.behavior;
-        if let Some(v) = b.show_all_when_empty { c.show_all_when_empty = v; }
-        if let Some(v) = b.placeholder { c.placeholder = v; }
-        if let Some(v) = b.terminal { c.terminal = v; }
+        if let Some(v) = b.show_all_when_empty {
+            c.show_all_when_empty = v;
+        }
+        if let Some(v) = b.placeholder {
+            c.placeholder = v;
+        }
+        if let Some(v) = b.terminal {
+            c.terminal = v;
+        }
+        if let Some(v) = b.animate {
+            c.animate = v;
+        }
+        if let Some(v) = b.animation_ms {
+            c.animation_ms = v;
+        }
     }
 }
 
 /// Parse `#rgb`, `#rrggbb`, or `#aarrggbb` into `0xAARRGGBB`. Returns None on
 /// anything malformed so the caller can keep its default.
-pub fn parse_color(s: &str) -> Option<u32> {
+fn parse_color(s: &str) -> Option<u32> {
     let h = s.trim().strip_prefix('#')?;
     let (a, rgb): (u32, &str) = match h.len() {
         3 => {
             // #rgb -> expand each nibble.
-            let mut v: u32 = 0xff000000;
+            let mut v: u32 = 0xff00_0000;
             for (i, ch) in h.chars().enumerate() {
                 let d = ch.to_digit(16)?;
                 v |= (d * 0x11) << (16 - i * 8);

@@ -39,3 +39,5 @@ show_all_when_empty = false      # false: show nothing until you type
 placeholder         = "Search…"  # prompt text shown while the query is empty
 terminal            = "xterm"    # used to wrap Terminal=true .desktop entries
                                  # (overridden by $QMENU_TERMINAL / $TERMINAL)
+animate             = true       # animate the results drawer growing/shrinking
+animation_ms        = 55.0       # drawer easing time constant (smaller = snappier)

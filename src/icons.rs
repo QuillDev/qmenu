@@ -10,14 +10,14 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// A decoded icon: a `size`×`size` straight-alpha RGBA8 bitmap.
-pub struct Icon {
-    pub size: u32,
-    pub rgba: Vec<u8>,
+pub(crate) struct Icon {
+    pub(crate) size: u32,
+    pub(crate) rgba: Vec<u8>,
 }
 
 /// Caches `Icon=` name -> decoded icon (or None when nothing was found/decoded),
 /// so repeated draws while filtering don't re-hit the filesystem or re-rasterise.
-pub struct IconLoader {
+pub(crate) struct IconLoader {
     size: u32,
     base_dirs: Vec<PathBuf>,
     themes: Vec<String>,
@@ -25,7 +25,7 @@ pub struct IconLoader {
 }
 
 impl IconLoader {
-    pub fn new(size: u32, theme: Option<String>) -> Self {
+    pub(crate) fn new(size: u32, theme: Option<String>) -> Self {
         let mut themes: Vec<String> = Vec::new();
         if let Some(t) = theme {
             themes.push(t);
@@ -37,7 +37,7 @@ impl IconLoader {
                 themes.push(t.to_string());
             }
         }
-        IconLoader {
+        Self {
             size,
             base_dirs: icon_base_dirs(),
             themes,
@@ -46,7 +46,7 @@ impl IconLoader {
     }
 
     /// Return the decoded icon for an `Icon=` value, using the cache.
-    pub fn get(&mut self, name: &str) -> Option<&Icon> {
+    pub(crate) fn get(&mut self, name: &str) -> Option<&Icon> {
         if !self.cache.contains_key(name) {
             let icon = self
                 .resolve(name)
@@ -68,7 +68,20 @@ impl IconLoader {
         }
 
         // Ordered list of theme-relative subpaths to probe, near-size first.
-        let mut sizes: Vec<u32> = vec![self.size, self.size * 2, 48, 64, 32, 128, 256, 24, 22, 16, 96, 512];
+        let mut sizes: Vec<u32> = vec![
+            self.size,
+            self.size * 2,
+            48,
+            64,
+            32,
+            128,
+            256,
+            24,
+            22,
+            16,
+            96,
+            512,
+        ];
         sizes.dedup();
         let mut rels: Vec<String> = Vec::new();
         for s in &sizes {
@@ -126,8 +139,7 @@ fn icon_base_dirs() -> Vec<PathBuf> {
         let home = PathBuf::from(home);
         v.push(home.join(".icons"));
         let data_home = std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".local/share"));
+            .map_or_else(|| home.join(".local/share"), PathBuf::from);
         v.push(data_home.join("icons"));
     }
     let data_dirs = std::env::var("XDG_DATA_DIRS")
@@ -151,7 +163,10 @@ fn pixmap_dirs() -> Vec<PathBuf> {
 /// preserving aspect ratio and centring within the square.
 fn decode_icon(path: &Path, size: u32) -> Option<Icon> {
     let data = std::fs::read(path).ok()?;
-    let is_svg = path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("svg")) == Some(true);
+    let is_svg = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("svg"));
     let (src, sw, sh) = if is_svg {
         decode_svg(&data, size)?
     } else {
@@ -214,9 +229,8 @@ fn fit_center(src: &[u8], sw: u32, sh: u32, size: u32) -> Vec<u8> {
     let dw = ((sw as f32 * scale).round() as u32).max(1).min(size);
     let dh = ((sh as f32 * scale).round() as u32).max(1).min(size);
 
-    let src_img = match image::RgbaImage::from_raw(sw, sh, src.to_vec()) {
-        Some(i) => i,
-        None => return vec![0u8; (size * size * 4) as usize],
+    let Some(src_img) = image::RgbaImage::from_raw(sw, sh, src.to_vec()) else {
+        return vec![0u8; (size * size * 4) as usize];
     };
     let resized = image::imageops::resize(&src_img, dw, dh, image::imageops::FilterType::Lanczos3);
 
