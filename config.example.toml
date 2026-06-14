@@ -25,6 +25,7 @@ pad_y             = 10.0    # inner vertical padding (px)
 corner_radius     = 14.0    # rounded-corner radius (px); 0 = square
 border_width      = 2.0     # outline thickness (px); 0 = no border
 row_radius        = 8.0     # selection highlight corner radius (px)
+result_gap        = 8.0     # gap between the prompt drawer and the results panel (px)
 # font_family     = "Inter" # omit to use the system default sans
 
 [icons]

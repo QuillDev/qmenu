@@ -43,6 +43,8 @@ pub struct Config {
     pub corner_radius: f32,
     pub border_width: f32,
     pub row_radius: f32,
+    /// Gap between the prompt panel and the results panel (px).
+    pub result_gap: f32,
     pub font_family: Option<String>,
     /// Vertical placement: "center" (default) or "top" (uses `margin_top`).
     pub anchor: String,
@@ -83,6 +85,7 @@ impl Default for Config {
             corner_radius: 14.0,
             border_width: 2.0,
             row_radius: 8.0,
+            result_gap: 8.0,
             font_family: None,
             anchor: "center".to_string(),
 
@@ -173,6 +176,7 @@ struct RawLayout {
     corner_radius: Option<f32>,
     border_width: Option<f32>,
     row_radius: Option<f32>,
+    result_gap: Option<f32>,
     font_family: Option<String>,
     anchor: Option<String>,
 }
@@ -218,6 +222,7 @@ impl RawConfig {
         if let Some(v) = l.corner_radius { c.corner_radius = v; }
         if let Some(v) = l.border_width { c.border_width = v; }
         if let Some(v) = l.row_radius { c.row_radius = v; }
+        if let Some(v) = l.result_gap { c.result_gap = v; }
         if l.font_family.is_some() { c.font_family = l.font_family; }
         if let Some(v) = l.anchor { c.anchor = v; }
 

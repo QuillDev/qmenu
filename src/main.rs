@@ -122,8 +122,15 @@ fn main() {
 
     let icon_loader = IconLoader::new(config.icon_size, config.icon_theme.clone());
 
-    // Pool sized for the largest buffer we might draw (full width × max height).
-    let max_height = row_top(&config, config.max_visible_items + 1) as u32 + config.pad_y as u32;
+    // Pool sized for the largest buffer we might draw (full width × max height:
+    // both panels fully populated, plus the gap between them).
+    let panel_pad = 2.0 * (config.pad_y + config.border_width);
+    let max_height = (config.line_height
+        + panel_pad
+        + config.result_gap
+        + config.max_visible_items as f32 * config.line_height
+        + panel_pad)
+        .ceil() as u32;
     let pool_cap = (2200 * max_height.max(1) * 4) as usize;
     let pool = SlotPool::new(pool_cap.max(256 * 256 * 4), &shm).expect("failed to create a buffer pool");
 
@@ -256,23 +263,26 @@ struct Qmenu {
     result: Option<String>,
 }
 
-/// Y of the top of row `n` (row 0 is the prompt) given config paddings.
-fn row_top(cfg: &Config, n: usize) -> f32 {
-    cfg.pad_y + cfg.border_width + n as f32 * cfg.line_height
-}
-
 impl Qmenu {
-    /// Number of result rows currently visible (0 when the query is empty and
-    /// `show_all_when_empty` is off).
-    fn visible_rows(&self) -> usize {
-        self.filtered.len().min(self.config.max_visible_items)
+    /// Number of result rows shown in the results panel right now.
+    fn visible_count(&self) -> usize {
+        let end = (self.scroll + self.config.max_visible_items).min(self.filtered.len());
+        end - self.scroll
     }
 
-    /// Height needed for the prompt row plus the visible results.
+    /// Total surface height: the constant prompt panel, plus (when there are
+    /// matches) a gap and a separate results panel below it.
     fn content_height(&self) -> u32 {
-        let rows = 1 + self.visible_rows();
-        (rows as f32 * self.config.line_height + 2.0 * (self.config.pad_y + self.config.border_width))
-            .ceil() as u32
+        let cfg = &self.config;
+        let panel_pad = 2.0 * (cfg.pad_y + cfg.border_width);
+        let prompt_h = cfg.line_height + panel_pad;
+        let nvis = self.visible_count();
+        let total = if nvis == 0 {
+            prompt_h
+        } else {
+            prompt_h + cfg.result_gap + (nvis as f32 * cfg.line_height + panel_pad)
+        };
+        total.ceil() as u32
     }
 
     fn recompute_filter(&mut self) {
@@ -437,20 +447,68 @@ impl Qmenu {
             .create_buffer(width as i32, height as i32, stride, wl_shm::Format::Argb8888)
             .expect("failed to create a drawing buffer");
 
-        paint_solid(canvas, cfg.bg);
+        // Transparent canvas: panels paint their own rounded shapes onto it, and
+        // the gap between them stays see-through.
+        clear(canvas);
 
+        let bw = cfg.border_width;
+        let panel_pad = 2.0 * (cfg.pad_y + bw);
+        let prompt_h = cfg.line_height + panel_pad;
         let icon_col = if cfg.icons_enabled {
             cfg.icon_size as f32 + cfg.icon_gap
         } else {
             0.0
         };
-        let text_x = cfg.pad_x + cfg.border_width + icon_col;
+        let text_x = cfg.pad_x + bw + icon_col;
 
-        // Selection highlight (rounded), behind the selected result row.
-        if !filtered.is_empty() {
-            let row = (*selected - *scroll) + 1; // +1: row 0 is the prompt.
-            let y0 = row_top(cfg, row);
-            let inset = cfg.border_width + 6.0;
+        // --- Prompt panel: a constant rounded drawer that never changes shape. --
+        draw_panel(
+            canvas, width, height, 0.0, 0.0, width as f32, prompt_h, cfg.corner_radius, bw, cfg.bg,
+            cfg.border,
+        );
+
+        let prompt_y = bw + cfg.pad_y;
+        let (prompt_text, prompt_color) = if query.is_empty() {
+            (cfg.placeholder.as_str(), cfg.muted)
+        } else {
+            (query.as_str(), cfg.fg)
+        };
+        draw_text_line(
+            font_system, swash_cache, canvas, width, height, cfg, text_x, prompt_y, prompt_text,
+            prompt_color,
+        );
+
+        // Solid caret at the cursor position in the prompt row.
+        let prefix_end = (*cursor).min(query.len());
+        let caret_x = text_x + measure_text(font_system, cfg, &query[..prefix_end]);
+        fill_solid(
+            canvas,
+            width,
+            height,
+            caret_x,
+            prompt_y + 3.0,
+            2.0,
+            cfg.line_height - 6.0,
+            cfg.prompt,
+        );
+
+        // --- Results panel: a separate drawer that slides out below the prompt. -
+        let end = (*scroll + cfg.max_visible_items).min(filtered.len());
+        let nvis = end - *scroll;
+        if nvis > 0 {
+            let ry = prompt_h + cfg.result_gap;
+            let results_h = nvis as f32 * cfg.line_height + panel_pad;
+            draw_panel(
+                canvas, width, height, 0.0, ry, width as f32, results_h, cfg.corner_radius, bw,
+                cfg.bg, cfg.border,
+            );
+
+            let rows_top = ry + bw + cfg.pad_y;
+
+            // Selection highlight (rounded), behind the selected row.
+            let srow = *selected - *scroll;
+            let y0 = rows_top + srow as f32 * cfg.line_height;
+            let inset = bw + 6.0;
             fill_round_rect(
                 canvas,
                 width,
@@ -462,68 +520,30 @@ impl Qmenu {
                 cfg.row_radius,
                 cfg.sel_bg,
             );
-        }
 
-        // Prompt row: typed query, or placeholder in muted when empty.
-        let (prompt_text, prompt_color) = if query.is_empty() {
-            (cfg.placeholder.as_str(), cfg.muted)
-        } else {
-            (query.as_str(), cfg.fg)
-        };
-        draw_text_line(
-            font_system,
-            swash_cache,
-            canvas,
-            width,
-            height,
-            cfg,
-            text_x,
-            row_top(cfg, 0),
-            prompt_text,
-            prompt_color,
-        );
+            for (vis, &idx) in filtered[*scroll..end].iter().enumerate() {
+                let y = rows_top + vis as f32 * cfg.line_height;
+                let entry = &entries[idx];
 
-        // Text caret at the cursor position in the prompt row.
-        let prefix_end = (*cursor).min(query.len());
-        let caret_x = text_x + measure_text(font_system, cfg, &query[..prefix_end]);
-        let cy = row_top(cfg, 0);
-        fill_round_rect(
-            canvas,
-            width,
-            height,
-            caret_x,
-            cy + 5.0,
-            2.0,
-            (cfg.line_height - 10.0).max(2.0),
-            1.0,
-            cfg.prompt,
-        );
-
-        // Result rows.
-        let end = (*scroll + cfg.max_visible_items).min(filtered.len());
-        for (vis, &idx) in filtered[*scroll..end].iter().enumerate() {
-            let row = vis + 1;
-            let y = row_top(cfg, row);
-            let entry = &entries[idx];
-
-            if cfg.icons_enabled {
-                if let Some(name) = &entry.icon {
-                    if let Some(icon) = icon_loader.get(name) {
-                        let iy = y + (cfg.line_height - icon.size as f32) / 2.0;
-                        blit_icon(canvas, width, height, cfg.pad_x + cfg.border_width, iy, icon);
+                if cfg.icons_enabled {
+                    if let Some(name) = &entry.icon {
+                        if let Some(icon) = icon_loader.get(name) {
+                            let iy = y + (cfg.line_height - icon.size as f32) / 2.0;
+                            blit_icon(canvas, width, height, cfg.pad_x + bw, iy, icon);
+                        }
                     }
                 }
-            }
 
-            let selected_row = *scroll + vis == *selected;
-            let color = if selected_row { cfg.sel_fg } else { cfg.fg };
-            draw_text_line(
-                font_system, swash_cache, canvas, width, height, cfg, text_x, y, &entry.name, color,
-            );
+                let color = if *scroll + vis == *selected { cfg.sel_fg } else { cfg.fg };
+                draw_text_line(
+                    font_system, swash_cache, canvas, width, height, cfg, text_x, y, &entry.name,
+                    color,
+                );
+            }
         }
 
-        // Rounded-corner mask + border, applied last (premultiplies alpha).
-        apply_frame(canvas, width, height, cfg.corner_radius, cfg.border_width, cfg.border);
+        // Convert the straight-alpha canvas to premultiplied (wl_shm expects it).
+        premultiply(canvas);
 
         let surface = layer.wl_surface();
         surface.attach(Some(buffer.wl_buffer()), 0, 0);
@@ -724,10 +744,102 @@ fn argb_to_text_color(c: u32) -> TextColor {
     )
 }
 
-fn paint_solid(canvas: &mut [u8], argb: u32) {
-    let bytes = argb.to_le_bytes(); // little-endian: [B, G, R, A] for Argb8888.
+/// Reset the canvas to fully transparent.
+fn clear(canvas: &mut [u8]) {
+    canvas.fill(0);
+}
+
+/// Fill a sharp rectangle by alpha-blending `argb` over the canvas (used for the
+/// caret).
+#[allow(clippy::too_many_arguments)]
+fn fill_solid(canvas: &mut [u8], cw: u32, ch: u32, x: f32, y: f32, w: f32, h: f32, argb: u32) {
+    let (r, g, b, a) = unpack(argb);
+    let x0 = x.round().max(0.0) as u32;
+    let y0 = y.round().max(0.0) as u32;
+    let x1 = ((x + w).round() as u32).min(cw);
+    let y1 = ((y + h).round() as u32).min(ch);
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let off = ((py * cw + px) * 4) as usize;
+            blend_px(canvas, off, r, g, b, a);
+        }
+    }
+}
+
+/// Multiply every pixel's RGB by its alpha, converting the straight-alpha canvas
+/// the rest of the drawing code builds into the premultiplied form wl_shm wants.
+fn premultiply(canvas: &mut [u8]) {
     for px in canvas.chunks_exact_mut(4) {
-        px.copy_from_slice(&bytes);
+        let a = px[3] as u32;
+        if a == 255 {
+            continue;
+        }
+        if a == 0 {
+            px[0] = 0;
+            px[1] = 0;
+            px[2] = 0;
+            continue;
+        }
+        px[0] = (px[0] as u32 * a / 255) as u8;
+        px[1] = (px[1] as u32 * a / 255) as u8;
+        px[2] = (px[2] as u32 * a / 255) as u8;
+    }
+}
+
+/// Paint a rounded-rect panel (translucent fill + border) onto the transparent
+/// canvas, writing straight-alpha pixels with anti-aliased outer edges. The
+/// border is composited over the fill so it reads correctly after premultiply.
+#[allow(clippy::too_many_arguments)]
+fn draw_panel(
+    canvas: &mut [u8],
+    cw: u32,
+    ch: u32,
+    x: f32,
+    y: f32,
+    pw: f32,
+    ph: f32,
+    radius: f32,
+    border_w: f32,
+    fill: u32,
+    border: u32,
+) {
+    let (fr, fg, fb, fa) = unpack(fill);
+    let (br, bg, bb, ba) = unpack(border);
+    let af = fa as f32 / 255.0;
+    let radius = radius.min(pw / 2.0).min(ph / 2.0).max(0.0);
+
+    let x0 = x.floor().max(0.0) as u32;
+    let y0 = y.floor().max(0.0) as u32;
+    let x1 = ((x + pw).ceil() as u32).min(cw);
+    let y1 = ((y + ph).ceil() as u32).min(ch);
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let d = rr_sdf(px as f32 + 0.5 - x, py as f32 + 0.5 - y, pw, ph, radius);
+            let cov = (0.5 - d).clamp(0.0, 1.0); // outer anti-aliased coverage
+            if cov <= 0.0 {
+                continue;
+            }
+            // Border alpha: 1 in the ring near the outer edge, fading to 0 at the
+            // inner edge.
+            let ab = if border_w > 0.0 {
+                (ba as f32 / 255.0) * (0.5 + d + border_w).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            // Border over fill (straight-alpha source-over).
+            let out_a = ab + af * (1.0 - ab);
+            let (mut rr, mut gg, mut bbc) = (0.0, 0.0, 0.0);
+            if out_a > 0.0 {
+                rr = (br as f32 * ab + fr as f32 * af * (1.0 - ab)) / out_a;
+                gg = (bg as f32 * ab + fg as f32 * af * (1.0 - ab)) / out_a;
+                bbc = (bb as f32 * ab + fb as f32 * af * (1.0 - ab)) / out_a;
+            }
+            let off = ((py * cw + px) * 4) as usize;
+            canvas[off] = bbc as u8;
+            canvas[off + 1] = gg as u8;
+            canvas[off + 2] = rr as u8;
+            canvas[off + 3] = (out_a * cov * 255.0) as u8;
+        }
     }
 }
 
@@ -824,44 +936,6 @@ fn fill_round_rect(canvas: &mut [u8], cw: u32, ch: u32, x: f32, y: f32, w: f32, 
             let a = (base_a as f32 * cov) as u32;
             let off = ((py * cw + px) * 4) as usize;
             blend_px(canvas, off, cr, cg, cb, a);
-        }
-    }
-}
-
-/// Stroke a rounded-rect border around the whole surface and make the area
-/// outside the rounded rect transparent (premultiplied), giving anti-aliased
-/// rounded corners. Run this last.
-fn apply_frame(canvas: &mut [u8], cw: u32, ch: u32, radius: f32, border_w: f32, border_argb: u32) {
-    let (br, bg, bb, ba) = unpack(border_argb);
-    let w = cw as f32;
-    let h = ch as f32;
-    let radius = radius.min(w / 2.0).min(h / 2.0).max(0.0);
-    for py in 0..ch {
-        for px in 0..cw {
-            let d = rr_sdf(px as f32 + 0.5, py as f32 + 0.5, w, h, radius);
-            // Coverage of the surface (1 inside, 0 outside, AA on the edge).
-            let outer = (0.5 - d).clamp(0.0, 1.0);
-            let off = ((py * cw + px) * 4) as usize;
-
-            // Border ring: pixels within `border_w` of the outer edge.
-            if border_w > 0.0 {
-                let ring = outer * (0.5 + d + border_w).clamp(0.0, 1.0);
-                if ring > 0.0 {
-                    let a = (ba as f32 * ring) as u32;
-                    blend_px(canvas, off, br, bg, bb, a);
-                }
-            }
-
-            // Fold the pixel's own (possibly translucent) alpha with the corner
-            // coverage, then premultiply — wl_shm Argb8888 is premultiplied, and
-            // this is what fades the corners to transparent. `outer` is 0..1 and
-            // the stored alpha is 0..255, so final_a is already 0..255.
-            let final_a = canvas[off + 3] as f32 * outer;
-            let factor = final_a / 255.0;
-            canvas[off] = (canvas[off] as f32 * factor) as u8;
-            canvas[off + 1] = (canvas[off + 1] as f32 * factor) as u8;
-            canvas[off + 2] = (canvas[off + 2] as f32 * factor) as u8;
-            canvas[off + 3] = final_a as u8;
         }
     }
 }
