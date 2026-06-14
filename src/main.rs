@@ -149,6 +149,7 @@ fn main() {
         entries,
         allow_custom,
         query: String::new(),
+        cursor: 0,
         filtered: Vec::new(),
         selected: 0,
         scroll: 0,
@@ -245,6 +246,8 @@ struct Qmenu {
     entries: Vec<Entry>,
     allow_custom: bool,
     query: String,
+    /// Byte offset of the text cursor within `query` (always on a char boundary).
+    cursor: usize,
     filtered: Vec<usize>,
     selected: usize,
     scroll: usize,
@@ -286,6 +289,87 @@ impl Qmenu {
         };
         self.selected = 0;
         self.scroll = 0;
+    }
+
+    // ---- Text-field editing (operates on `query`/`cursor`) ---------------------
+
+    fn insert_char(&mut self, ch: char) {
+        self.query.insert(self.cursor, ch);
+        self.cursor += ch.len_utf8();
+    }
+
+    fn prev_boundary(&self) -> usize {
+        self.query[..self.cursor]
+            .char_indices()
+            .last()
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    }
+
+    fn next_boundary(&self) -> usize {
+        self.query[self.cursor..]
+            .chars()
+            .next()
+            .map(|c| self.cursor + c.len_utf8())
+            .unwrap_or(self.cursor)
+    }
+
+    /// Start of the word before the cursor (skips trailing whitespace, then the
+    /// word), for Ctrl/Alt+Left and word deletion.
+    fn prev_word(&self) -> usize {
+        let chars: Vec<(usize, char)> = self.query[..self.cursor].char_indices().collect();
+        let mut k = chars.len();
+        while k > 0 && chars[k - 1].1.is_whitespace() {
+            k -= 1;
+        }
+        while k > 0 && !chars[k - 1].1.is_whitespace() {
+            k -= 1;
+        }
+        chars.get(k).map(|(i, _)| *i).unwrap_or(0)
+    }
+
+    /// End of the word after the cursor (skips leading whitespace, then the word).
+    fn next_word(&self) -> usize {
+        let chars: Vec<(usize, char)> = self.query[self.cursor..].char_indices().collect();
+        let mut j = 0;
+        while j < chars.len() && chars[j].1.is_whitespace() {
+            j += 1;
+        }
+        while j < chars.len() && !chars[j].1.is_whitespace() {
+            j += 1;
+        }
+        chars.get(j).map(|(i, _)| self.cursor + *i).unwrap_or(self.query.len())
+    }
+
+    fn backspace(&mut self) {
+        let p = self.prev_boundary();
+        self.query.replace_range(p..self.cursor, "");
+        self.cursor = p;
+    }
+
+    fn delete_forward(&mut self) {
+        let n = self.next_boundary();
+        self.query.replace_range(self.cursor..n, "");
+    }
+
+    fn delete_word_back(&mut self) {
+        let p = self.prev_word();
+        self.query.replace_range(p..self.cursor, "");
+        self.cursor = p;
+    }
+
+    fn delete_word_forward(&mut self) {
+        let n = self.next_word();
+        self.query.replace_range(self.cursor..n, "");
+    }
+
+    fn kill_to_start(&mut self) {
+        self.query.replace_range(0..self.cursor, "");
+        self.cursor = 0;
+    }
+
+    fn kill_to_end(&mut self) {
+        self.query.truncate(self.cursor);
     }
 
     /// Resize the surface to fit the current results, then redraw.
@@ -342,6 +426,7 @@ impl Qmenu {
             entries,
             filtered,
             query,
+            cursor,
             selected,
             scroll,
             ..
@@ -396,6 +481,22 @@ impl Qmenu {
             row_top(cfg, 0),
             prompt_text,
             prompt_color,
+        );
+
+        // Text caret at the cursor position in the prompt row.
+        let prefix_end = (*cursor).min(query.len());
+        let caret_x = text_x + measure_text(font_system, cfg, &query[..prefix_end]);
+        let cy = row_top(cfg, 0);
+        fill_round_rect(
+            canvas,
+            width,
+            height,
+            caret_x,
+            cy + 5.0,
+            2.0,
+            (cfg.line_height - 10.0).max(2.0),
+            1.0,
+            cfg.prompt,
         );
 
         // Result rows.
@@ -463,6 +564,27 @@ fn draw_text_line(
         // it (don't override `c.a()`) or glyphs render as solid boxes.
         blend_rect(canvas, cw, ch, x as i32 + gx, y as i32 + gy, gw, gh, c);
     });
+}
+
+/// Shaped pixel width of a single line of text (used to place the caret).
+fn measure_text(font_system: &mut FontSystem, cfg: &Config, text: &str) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let metrics = Metrics::new(cfg.font_size, cfg.line_height);
+    let mut buffer = TextBuffer::new(font_system, metrics);
+    buffer.set_wrap(font_system, Wrap::None);
+    buffer.set_size(font_system, None, Some(cfg.line_height));
+    let mut attrs = Attrs::new();
+    if let Some(fam) = &cfg.font_family {
+        attrs = attrs.family(Family::Name(fam));
+    }
+    buffer.set_text(font_system, text, attrs, Shaping::Advanced);
+    buffer.shape_until_scroll(font_system, false);
+    buffer
+        .layout_runs()
+        .map(|r| r.line_w)
+        .fold(0.0_f32, f32::max)
 }
 
 // ---- Desktop entries (drun mode) ----------------------------------------------
@@ -821,6 +943,8 @@ impl KeyboardHandler for Qmenu {
 
     fn press_key(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, event: KeyEvent) {
         let ctrl = self.modifiers.ctrl;
+        let alt = self.modifiers.alt;
+        let word = ctrl || alt; // modifier for word-wise motion / deletion
         match event.keysym {
             Keysym::Escape => {
                 self.exit = true;
@@ -830,14 +954,42 @@ impl KeyboardHandler for Qmenu {
                 self.confirm();
                 return;
             }
-            Keysym::BackSpace => {
-                self.query.pop();
-                self.recompute_filter();
-            }
+
+            // List navigation.
             Keysym::Up => self.move_selection(-1),
             Keysym::Down => self.move_selection(1),
             Keysym::Page_Up => self.move_selection(-(self.config.max_visible_items as isize)),
             Keysym::Page_Down => self.move_selection(self.config.max_visible_items as isize),
+
+            // Cursor motion within the query (word-wise with Ctrl/Alt).
+            Keysym::Left => {
+                self.cursor = if word { self.prev_word() } else { self.prev_boundary() }
+            }
+            Keysym::Right => {
+                self.cursor = if word { self.next_word() } else { self.next_boundary() }
+            }
+            Keysym::Home => self.cursor = 0,
+            Keysym::End => self.cursor = self.query.len(),
+
+            // Deletion (word-wise with Ctrl/Alt).
+            Keysym::BackSpace => {
+                if word {
+                    self.delete_word_back();
+                } else {
+                    self.backspace();
+                }
+                self.recompute_filter();
+            }
+            Keysym::Delete => {
+                if word {
+                    self.delete_word_forward();
+                } else {
+                    self.delete_forward();
+                }
+                self.recompute_filter();
+            }
+
+            // Emacs/readline-style Ctrl bindings.
             _ if ctrl => match event.keysym {
                 Keysym::p => self.move_selection(-1),
                 Keysym::n => self.move_selection(1),
@@ -845,26 +997,42 @@ impl KeyboardHandler for Qmenu {
                     self.exit = true;
                     return;
                 }
+                Keysym::a => self.cursor = 0,
+                Keysym::e => self.cursor = self.query.len(),
+                Keysym::b => self.cursor = self.prev_boundary(),
+                Keysym::f => self.cursor = self.next_boundary(),
                 Keysym::u => {
-                    self.query.clear();
+                    self.kill_to_start();
+                    self.recompute_filter();
+                }
+                Keysym::k => {
+                    self.kill_to_end();
                     self.recompute_filter();
                 }
                 Keysym::w => {
-                    while self.query.ends_with(' ') {
-                        self.query.pop();
-                    }
-                    while !self.query.is_empty() && !self.query.ends_with(' ') {
-                        self.query.pop();
-                    }
+                    self.delete_word_back();
                     self.recompute_filter();
                 }
                 _ => {}
             },
+
+            // Alt word bindings (Alt+b/f move, Alt+d delete forward word).
+            _ if alt => match event.keysym {
+                Keysym::b => self.cursor = self.prev_word(),
+                Keysym::f => self.cursor = self.next_word(),
+                Keysym::d => {
+                    self.delete_word_forward();
+                    self.recompute_filter();
+                }
+                _ => {}
+            },
+
+            // Printable input: insert at the cursor.
             _ => {
                 if let Some(text) = event.utf8 {
                     for ch in text.chars() {
                         if !ch.is_control() {
-                            self.query.push(ch);
+                            self.insert_char(ch);
                         }
                     }
                     self.recompute_filter();
